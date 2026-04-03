@@ -1,0 +1,55 @@
+services:
+  mariadb:
+    image: mariadb:10.11
+    container_name: mariadb
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_INITDB_SKIP_TZINFO: 1
+    ports:
+      - "3306:3306"
+    volumes:
+      - ${DIR}/mariadb_data:/var/lib/mysql
+      - ${DIR}/sql-scripts:/docker-entrypoint-initdb.d
+      #- ./config/my.cnf:/etc/mysql/my.cnf
+      - ${ADIR}/logs:/var/log/mysql
+    
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+    networks:
+      - mariadb_network
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: phpmyadmin
+    restart: always
+    environment:
+      PMA_HOST: mariadb
+      PMA_PORT: 3306
+      #PMA_SSL: 1
+      #PMA_ABSOLUTE_URI: ${PMA_ABSOLUTE_URI}
+      PMA_USER: ${MYSQL_USER}
+      PMA_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "8080:80"
+    volumes:
+      - ${AH_DIR}/phpmyadmin/uploads:/var/www/html/upload
+    #  - ./phpmyadmin/config/config.user.inc.php:/etc/phpmyadmin/config.user.inc.php
+    #  - ./phpmyadmin/sessions:/sessions:rw
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    networks:
+      - mariadb_network
+
+networks:
+  mariadb_network:
+    driver: bridge
