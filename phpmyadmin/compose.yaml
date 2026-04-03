@@ -1,0 +1,28 @@
+services:
+  phpmyadmin:
+    image: phpmyadmin:${TAG:-5.2.3}
+    container_name: ${CNTNR:-phpmyadmin}
+    restart: unless-stopped
+    ports:
+      - ${HOST_PORT:-8989}:80"
+    environment:
+      PMA_ARBITRARY: 1
+      MEMORY_LIMIT: 512M           # Default: 512M
+      UPLOAD_LIMIT: 2048M          # Default: 2048K (file upload size)
+      MAX_EXECUTION_TIME: 600      # Default: 600 (seconds)
+      TZ: Europe/Vienna
+      MYSQL_USER_REMOTE: ${MYSQL_USER_REMOTE}
+      MYSQL_PASSWORD_REMOTE: ${MYSQL_PASSWORD_REMOTE}
+      MYSQL_USER_L1: ${MYSQL_USER_L1}
+      MYSQL_PASSWORD_L1: ${MYSQL_PASSWORD_L1}
+      MYSQL_USER_L2: ${MYSQL_USER_L2}
+      MYSQL_PASSWORD_L2: ${MYSQL_PASSWORD_L2}
+    volumes:
+      - ${DIR}/config/config.user.inc.php:/etc/phpmyadmin/config.user.inc.php
+      - ${DIR}/uploads:/var/www/html/upload
+    networks:
+      - phpmyadmin_network
+
+networks:
+  phpmyadmin_network:
+    external: true
