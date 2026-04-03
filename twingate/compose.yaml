@@ -1,0 +1,13 @@
+services:
+  twingate_connector:
+    container_name: ${CNTNR:-twingate_connector}
+    restart: always
+    image: twingate/connector:${TAG:-1.85.0}
+    environment:
+      - TWINGATE_NETWORK=${NETWORK}
+      - TWINGATE_ACCESS_TOKEN=${TWINGATE_ACCESS_TOKEN}
+      - TWINGATE_REFRESH_TOKEN=${TWINGATE_REFRESH_TOKEN}
+      - TWINGATE_LOG_ANALYTICS=v2
+      - TWINGATE_LOG_LEVEL=3
+    sysctls:
+      net.ipv4.ping_group_range: "0 2147483647"
