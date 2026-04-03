@@ -1,0 +1,123 @@
+services:
+  postgres:
+    image: postgres:${POSTGRES_IMAGE:-16}
+    container_name: ${POSTGRES_CNTNR:-n8n_postgres}
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ${N8N_DIR:-/home/administrator/n8n}/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:${REDIS_IMAGE:-7-alpine}
+    container_name: ${REDIS_CNTNR:-n8n_redis}
+    restart: always
+    volumes:
+      - ${N8N_DIR:-/home/administrator/n8n}/data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  n8n:
+    image: n8nio/n8n:${N8N_IMAGE:-2.0.0}
+    container_name: ${N8N_CNTNR:-n8n}
+    restart: always
+    ports:
+      - "${HOST_PORT:-5678}:5678"
+    environment:
+      NODE_ENV: "production"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: "https"
+      N8N_EDITOR_BASE_URL: ${EDITOR_URL}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      N8N_PROXY_HOPS: 1
+      GENERIC_TIMEZONE: "Europe/Vienna"
+      TZ: "Europe/Vienna"
+      DB_TYPE: "postgresdb"
+      DB_POSTGRESDB_HOST: "postgres"
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      EXECUTIONS_MODE: "queue"
+      QUEUE_BULL_REDIS_HOST: "redis"
+      QUEUE_BULL_REDIS_PORT: 6379
+      QUEUE_HEALTH_CHECK_ACTIVE: "true"
+      OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_RUNNERS_MODE: "external"
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+      N8N_RUNNERS_BROKER_LISTEN_ADDRESS: "0.0.0.0"
+      ## 2.0 security knobs you *might* tweak later:
+      # N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      # N8N_RESTRICT_FILE_ACCESS_TO: "/home/node"
+    volumes:
+      # n8n internal data (config, encryption key, etc.)
+      - ${N8N_DIR:-/home/administrator/n8n}/data/n8n:/home/node/.n8n
+      # file sandbox path (2.0 default)
+      - ${N8N_DIR:-/home/administrator/n8n}/local-files:/home/node/.n8n-files
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+        
+  n8n-worker:
+    image: n8nio/n8n:${N8N_IMAGE:-2.0.0}
+    container_name: ${N8N_WORKER_CNTNR:-n8n_worker}
+    restart: always
+    command: worker
+    environment:
+      NODE_ENV: "production"
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      DB_TYPE: "postgresdb"
+      DB_POSTGRESDB_HOST: "postgres"
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      EXECUTIONS_MODE: "queue"
+      QUEUE_BULL_REDIS_HOST: "redis"
+      QUEUE_BULL_REDIS_PORT: 6379
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_RUNNERS_MODE: "external"
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+      N8N_RUNNERS_BROKER_LISTEN_ADDRESS: "0.0.0.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  n8n-runners-main:
+    image: n8nio/runners:${RUNNERS_IMAGE:-2.0.0}
+    container_name: ${N8N_RUNNERS_MAIN_CNTNR:-n8n_runners-main}
+    restart: always
+    environment:
+      N8N_RUNNERS_TASK_BROKER_URI: "http://n8n:5679"
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+    depends_on:
+      - n8n
+
+  n8n-runners-worker:
+    image: n8nio/runners:${RUNNERS_IMAGE:-2.0.0}
+    container_name: ${N8N_RUNNERS_WORKER_CNTNR:-n8n_runners-worker}
+    restart: always
+    environment:
+      N8N_RUNNERS_TASK_BROKER_URI: "http://n8n-worker:5679"
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+    depends_on:
+      - n8n-worker
