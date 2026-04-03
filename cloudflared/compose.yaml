@@ -1,0 +1,12 @@
+services:
+   cloudflared:
+      image: cloudflare/cloudflared:${TAG:-2025.10.1}
+      container_name: ${CNTNR:-cloudflared}
+      restart: unless-stopped
+      command: tunnel run
+      environment:
+       - "TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}"
+      networks:
+        - cloudflared
+networks:
+   cloudflared:
