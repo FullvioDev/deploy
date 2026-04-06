@@ -1,6 +1,6 @@
 services:
   git-sync:
-    image: registry.k8s.io/git-sync/git-sync:${TAG:-v4.3.0}
+    image: registry.k8s.io/git-sync/git-sync:${TAG:-v4.6.0}
     container_name: ${CNTNR:-git-sync}
     restart: unless-stopped
     environment:
