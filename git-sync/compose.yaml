@@ -15,7 +15,7 @@ services:
       GITSYNC_PASSWORD: "${GITSYNC_TOKEN}"
       GITSYNC_SPARSE_CHECKOUT_FILE: "/etc/git-sync/sparse-checkout"
     command:
-      - --sync-hook-command=/scripts/${SCRIPT}.sh
+      - --exechook-command=/scripts/${SCRIPT}.sh
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${TARGET_DIR}/data:/git
