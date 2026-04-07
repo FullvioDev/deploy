@@ -1,6 +1,6 @@
 services:
    cloudflared:
-      image: cloudflare/cloudflared:${TAG:-2025.10.1}
+      image: cloudflare/cloudflared:${TAG:-2026.3.0}
       container_name: ${CNTNR:-cloudflared}
       restart: unless-stopped
       command: tunnel run
