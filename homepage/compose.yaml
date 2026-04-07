@@ -1,0 +1,11 @@
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:${TAG:-latest}
+    container_name: ${CNTNR:-homepage}
+    ports:
+      - ${HOST_PORT:-3000}:3000
+    volumes:
+      - ${DIR:-/home/administrator/homepage}/config:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      HOMEPAGE_ALLOWED_HOSTS: ${HOMEPAGE_ALLOWED_HOSTS}
