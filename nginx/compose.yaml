@@ -1,6 +1,6 @@
 services:
   nginx:
-    image: nginx:${TAG:-1.27-alpine}
+    image: nginx:${TAG:-1.30-alpine}
     container_name: ${CNTNR:-nginx}
     ports:
       - "${HOST_PORT:-8080}:80"
