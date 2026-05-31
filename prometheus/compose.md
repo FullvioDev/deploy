@@ -1,1 +1,1 @@
-[./monitoring/compose.yaml](./monitoring/compose.yaml)
+[../monitoring/compose.yaml](../monitoring/compose.yaml)
