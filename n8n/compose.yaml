@@ -61,6 +61,18 @@ services:
       N8N_RUNNERS_MODE: "external"
       N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
       N8N_RUNNERS_BROKER_LISTEN_ADDRESS: "0.0.0.0"
+      N8N_METRICS: "true"
+      N8N_METRICS_PREFIX: "n8n_"
+      N8N_METRICS_INCLUDE_DEFAULT_METRICS: "true"
+      N8N_METRICS_INCLUDE_CACHE_METRICS: "true"
+      N8N_METRICS_INCLUDE_MESSAGE_EVENT_BUS_METRICS: "true"
+      N8N_METRICS_INCLUDE_NODE_TYPE_LABEL: "true"
+      N8N_METRICS_INCLUDE_WORKFLOW_ID_LABEL: "true"
+      N8N_METRICS_INCLUDE_QUEUE_METRICS: "true"
+      N8N_METRICS_QUEUE_METRICS_INTERVAL: "10"
+      N8N_METRICS_INCLUDE_API_ENDPOINTS: "true"
+      N8N_METRICS_INCLUDE_API_METHOD_LABEL: "true"
+      N8N_METRICS_INCLUDE_API_STATUS_CODE_LABEL: "true"
     volumes:
       - ${N8N_DIR:-/home/administrator/n8n}/data/n8n:/home/node/.n8n
       - ${N8N_DIR:-/home/administrator/n8n}/local-files:/home/node/.n8n-files
@@ -75,6 +87,8 @@ services:
     container_name: ${N8N_WORKER_CNTNR:-n8n_worker}
     restart: always
     command: worker
+    ports:
+      - "${WORKER_METRICS_PORT:-5688}:5678"
     environment:
       NODE_ENV: "production"
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
@@ -91,6 +105,15 @@ services:
       N8N_RUNNERS_MODE: "external"
       N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
       N8N_RUNNERS_BROKER_LISTEN_ADDRESS: "0.0.0.0"
+      QUEUE_HEALTH_CHECK_ACTIVE: "true"
+      QUEUE_HEALTH_CHECK_PORT: 5678
+      N8N_METRICS: "true"
+      N8N_METRICS_PREFIX: "n8n_"
+      N8N_METRICS_INCLUDE_DEFAULT_METRICS: "true"
+      N8N_METRICS_INCLUDE_CACHE_METRICS: "true"
+      N8N_METRICS_INCLUDE_MESSAGE_EVENT_BUS_METRICS: "true"
+      N8N_METRICS_INCLUDE_NODE_TYPE_LABEL: "true"
+      N8N_METRICS_INCLUDE_WORKFLOW_ID_LABEL: "true"
     depends_on:
       postgres:
         condition: service_healthy
