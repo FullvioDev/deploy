@@ -1,1 +1,1 @@
-[./prometheus/compose.yaml](./prometheus/compose.yaml)
+[./monitoring/compose.yaml](./monitoring/compose.yaml)
