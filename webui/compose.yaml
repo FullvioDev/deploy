@@ -50,7 +50,7 @@ services:
             - webui
 
     webui:
-        image: fullvio/webui:${WEBUI_TAG:-v0.9.5F}
+        image: fullvio/webui:${WEBUI_TAG:-v0.9.6F}
         container_name: ${WEBUI_CNTNR:-webui}
         restart: always
         security_opt:
