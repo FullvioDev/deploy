@@ -49,8 +49,8 @@ services:
         networks:
             - webui
 
-    fullvio-webui:
-        image: fullviodev/fullvio-webui:${WEBUI_TAG:-v0.9.5F}
+    webui:
+        image: fullvio/webui:${WEBUI_TAG:-v0.9.5F}
         container_name: ${WEBUI_CNTNR:-webui}
         restart: always
         security_opt:
