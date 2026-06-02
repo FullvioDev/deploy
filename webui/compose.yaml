@@ -70,11 +70,12 @@ services:
                 max-size: "10m"
                 max-file: "5"
         environment:
+            DOCKER: "true"
             ENV: "prod"
             PORT: "8080"
             UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
             GLOBAL_LOG_LEVEL: ${WEBUI_LOG_LEVEL:-INFO}
-            ENABLE_PERSISTENT_CONFIG: "false"
+            ENABLE_PERSISTENT_CONFIG: ${ENABLE_PERSISTENT_CONFIG:-false}
             ENABLE_VERSION_UPDATE_CHECK: ${ENABLE_VERSION_UPDATE_CHECK:-false}
             OFFLINE_MODE: "false"
             CUSTOM_NAME: ${CUSTOM_NAME}
@@ -118,6 +119,15 @@ services:
             OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
             OTEL_EXPORTER_OTLP_INSECURE: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
             OTEL_METRICS_EXPORT_INTERVAL_MILLIS: ${OTEL_METRICS_EXPORT_INTERVAL_MILLIS:-60000}
+            ENABLE_OPENAI_API: "true"
+            OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URLS:-}
+            OPENAI_API_KEYS: ${OPENAI_API_KEYS:-}
+            ENABLE_EVALUATION_ARENA_MODELS: ${ENABLE_EVALUATION_ARENA_MODELS:-false}
+            ENABLE_OLLAMA_API: ${ENABLE_OLLAMA_API:-false}
+            ENABLE_API_KEYS: ${ENABLE_API_KEYS:-false}
+            ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS: ${ENABLE_API_KEYS_ENDPOINT_RESTRICTIONS:-false}
+            API_KEYS_ALLOWED_ENDPOINTS: ${API_KEYS_ALLOWED_ENDPOINTS:-}
+            CUSTOM_API_KEY_HEADER: ${CUSTOM_API_KEY_HEADER:-x-api-key}
         healthcheck:
             test:
                 [
