@@ -43,7 +43,7 @@ services:
                 max-size: "10m"
                 max-file: "5"
         environment:
-            PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@local}
+            PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@fullvio.com}
             PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
             PGADMIN_SERVER_JSON_FILE: "/var/lib/pgadmin/pgadmin-servers.json"
             PGADMIN_LISTEN_PORT: "5050"
