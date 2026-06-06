@@ -43,13 +43,13 @@ services:
                 max-size: "10m"
                 max-file: "5"
         environment:
-            PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@fullvio.com}
-            PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+            PGADMIN_DEFAULT_EMAIL: ${ADMIN_EMAIL}
+            PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
             PGADMIN_SERVER_JSON_FILE: "/var/lib/pgadmin/pgadmin-servers.json"
             PGADMIN_LISTEN_PORT: "5050"
             PGADMIN_DISABLE_POSTFIX: "True"
-            PGADMIN_CONFIG_SERVER_MODE: "False"
-            PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+            PGADMIN_CONFIG_SERVER_MODE: "True"
+            PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
             PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
         healthcheck:
             test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5050/misc/ping"]
