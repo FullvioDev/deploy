@@ -28,7 +28,7 @@ services:
       retries: 10
 
   n8n:
-    image: n8nio/n8n:${N8N_IMAGE:-2.22.3}
+    image: n8nio/n8n:${N8N_IMAGE:-2.31.5}
     container_name: ${N8N_CNTNR:-n8n}
     restart: always
     ports:
@@ -83,7 +83,7 @@ services:
         condition: service_healthy
         
   n8n-worker:
-    image: n8nio/n8n:${N8N_IMAGE:-2.22.3}
+    image: n8nio/n8n:${N8N_IMAGE:-2.31.5}
     container_name: ${N8N_WORKER_CNTNR:-n8n_worker}
     restart: always
     command: worker
@@ -121,7 +121,7 @@ services:
         condition: service_healthy
 
   n8n-runners-main:
-    image: n8nio/runners:${RUNNERS_IMAGE:-2.22.3}
+    image: n8nio/runners:${RUNNERS_IMAGE:-2.31.5}
     container_name: ${N8N_RUNNERS_MAIN_CNTNR:-n8n_runners-main}
     restart: always
     environment:
@@ -131,7 +131,7 @@ services:
       - n8n
 
   n8n-runners-worker:
-    image: n8nio/runners:${RUNNERS_IMAGE:-2.22.3}
+    image: n8nio/runners:${RUNNERS_IMAGE:-2.31.5}
     container_name: ${N8N_RUNNERS_WORKER_CNTNR:-n8n_runners-worker}
     restart: always
     environment:
