@@ -34,6 +34,11 @@ services:
       JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-86400000}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://curipet.com,https://www.curipet.com}
       PORT: "8080"
+      # Set to "dev" to seed vet@test.curipet.com / owner1@test.curipet.com /
+      # owner2@test.curipet.com with sample pets + appointments on first boot
+      # of an empty database. Leave unset on any deployment with real data —
+      # this must never be "dev" on production.
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-}
     depends_on:
       postgres:
         condition: service_healthy
