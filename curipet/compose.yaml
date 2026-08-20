@@ -1,0 +1,89 @@
+services:
+  curipet:
+    image: ghcr.io/fullviodev/curipet:${CURIPET_IMAGE_TAG:-latest}
+    container_name: ${CURIPET_CNTNR:-curipet}
+    restart: unless-stopped
+    ports:
+      - "${CURIPET_HTTP_PORT:-8090}:5000"
+    environment:
+      NODE_ENV: production
+      PORT: "5000"
+      APP_URL: ${APP_URL}
+      SESSION_SECRET: ${SESSION_SECRET}
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-2}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+
+      # api mode: no direct database access, everything goes through CuripetAPI
+      STORAGE_BACKEND: api
+      CURIPET_API_URL: ${CURIPET_API_URL}
+      CURIPET_API_PUBLIC_URL: ${CURIPET_API_PUBLIC_URL}
+      JWT_SECRET: ${JWT_SECRET}
+
+      # Stripe (B2C paywall + Connect)
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      STRIPE_CONNECT_WEBHOOK_SECRET: ${STRIPE_CONNECT_WEBHOOK_SECRET}
+      STRIPE_PRODUCT_ID: ${STRIPE_PRODUCT_ID}
+
+      # Ops health probe (GET /api/ops/health)
+      OPS_HEALTH_TOKEN: ${OPS_HEALTH_TOKEN}
+
+      # AI chat (n8n)
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL}
+      CF_ACCESS_CLIENT_ID: ${CF_ACCESS_CLIENT_ID}
+      CF_ACCESS_CLIENT_SECRET: ${CF_ACCESS_CLIENT_SECRET}
+
+      # Voice dictation (OpenAI)
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_TRANSCRIBE_MODEL: ${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
+      OPENAI_REPORT_MODEL: ${OPENAI_REPORT_MODEL:-gpt-4o-mini}
+
+      # Phone receptionist (ElevenLabs)
+      VOICE_TOOL_SECRET: ${VOICE_TOOL_SECRET}
+      ELEVENLABS_WEBHOOK_SECRET: ${ELEVENLABS_WEBHOOK_SECRET}
+
+      # SMTP (outbound notification email)
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      DEMO_LEAD_RECIPIENTS: ${DEMO_LEAD_RECIPIENTS}
+
+      # WhatsApp Business Cloud API (Meta)
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN}
+      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET}
+      WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:-v21.0}
+      WHATSAPP_TEMPLATE_REMINDER: ${WHATSAPP_TEMPLATE_REMINDER}
+      WHATSAPP_TEMPLATE_REENGAGEMENT: ${WHATSAPP_TEMPLATE_REENGAGEMENT}
+      WHATSAPP_TEMPLATE_LANG: ${WHATSAPP_TEMPLATE_LANG:-sk}
+      WHATSAPP_WABA_ID: ${WHATSAPP_WABA_ID}
+
+      # SMS (Twilio)
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      SMS_FROM_E164: ${SMS_FROM_E164}
+      SMS_SENDER_ID: ${SMS_SENDER_ID}
+      SMS_WEBHOOK_BASE_URL: ${SMS_WEBHOOK_BASE_URL}
+      SMS_STATUS_CALLBACK_URL: ${SMS_STATUS_CALLBACK_URL}
+
+      # Inbound email (Postmark -> lab results)
+      INBOUND_EMAIL_USER: ${INBOUND_EMAIL_USER}
+      INBOUND_EMAIL_PASS: ${INBOUND_EMAIL_PASS}
+      INBOUND_EMAIL_DOMAIN: ${INBOUND_EMAIL_DOMAIN:-in.curipet.com}
+
+      # Blog engine keyword research (DataForSEO)
+      DATAFORSEO_LOGIN: ${DATAFORSEO_LOGIN}
+      DATAFORSEO_PASSWORD: ${DATAFORSEO_PASSWORD}
+
+      PASSWORD_RESET_LIMIT: ${PASSWORD_RESET_LIMIT:-10}
+      UPLOADS_DIR: /data/uploads
+    volumes:
+      - ${CURIPET_DIR:-/home/administrator/curipet}/data/uploads:/data/uploads
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

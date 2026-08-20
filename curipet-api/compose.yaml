@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:${POSTGRES_IMAGE:-16-alpine}
+    container_name: ${POSTGRES_CNTNR:-curipet_api_postgres}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-curipet}
+      POSTGRES_USER: ${POSTGRES_USER:-curipet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ${CURIPET_API_DIR:-/home/administrator/curipet-api}/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-curipet} -d ${POSTGRES_DB:-curipet}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  api:
+    image: ghcr.io/fullviodev/curipet-api:${CURIPET_API_IMAGE_TAG:-latest}
+    container_name: ${CURIPET_API_CNTNR:-curipet-api}
+    restart: unless-stopped
+    # Without this the JVM's -XX:MaxRAMPercentage=75.0 claims 75% of the HOST's
+    # RAM, not the container's — see the Dockerfile ENTRYPOINT.
+    mem_limit: 512m
+    ports:
+      - "${CURIPET_API_PORT:-8080}:8080"
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-curipet}
+      DB_USER: ${POSTGRES_USER:-curipet}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      # MUST equal curipet's JWT_SECRET (openssl rand -hex 32)
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-86400000}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://curipet.com,https://www.curipet.com}
+      PORT: "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
