@@ -39,6 +39,9 @@ services:
       # of an empty database. Leave unset on any deployment with real data —
       # this must never be "dev" on production.
       SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-}
+      # Debug the JWT filter (bad signature / expired / malformed claim) —
+      # blank by default, set to DEBUG in Dockhand only while investigating.
+      LOGGING_LEVEL_COM_CURIPET_API_SECURITY: ${LOGGING_LEVEL_COM_CURIPET_API_SECURITY:-}
     depends_on:
       postgres:
         condition: service_healthy
