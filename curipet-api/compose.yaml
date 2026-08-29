@@ -34,6 +34,27 @@ services:
       JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-86400000}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://curipet.com,https://www.curipet.com}
       PORT: "8080"
+      # ── Stripe: the B2C subscription webhook ──────────────────────────────
+      # SET THIS IN DOCKHAND ON THIS STACK. It used to live only on the curipet
+      # stack, where stripe-replit-sync verified the webhook and mirrored Stripe
+      # into a `stripe.*` schema over a Postgres pool it opened itself — from the
+      # public-facing container that deliberately holds no database credentials.
+      # That rail moved here, to the service that owns the database.
+      #
+      # Stripe still DELIVERS to the app (only it is routed publicly); the app
+      # forwards the raw bytes to POST /api/stripe/webhook here with its service
+      # token, and the signature is verified against this secret.
+      #
+      # BLANK REFUSES EVERY DELIVERY WITH 503 — deliberately, so a
+      # misconfiguration is visible on Stripe's dashboard rather than silently
+      # swallowing subscriptions. An on-prem install that sells no subscriptions
+      # leaves it blank and runs on manually granted users.subscription_status.
+      #
+      # NO STRIPE_SECRET_KEY HERE, on purpose: verifying a signature is HMAC over
+      # the request bytes and this service makes no outbound Stripe calls, so the
+      # API key stays on the curipet stack with the Checkout/Portal flows.
+      # STRIPE_CONNECT_WEBHOOK_SECRET stays there too — that rail is Node's.
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       # Set to "dev" to seed vet@test.curipet.com / owner1@test.curipet.com /
       # owner2@test.curipet.com with sample pets + appointments on first boot
       # of an empty database. Leave unset on any deployment with real data —

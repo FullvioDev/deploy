@@ -20,10 +20,31 @@ services:
       JWT_SECRET: ${JWT_SECRET}
 
       # Stripe (B2C paywall + Connect)
+      # Checkout and Billing Portal sessions, and the whole Connect rail.
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
-      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      # STRIPE_WEBHOOK_SECRET IS NOT READ HERE ANY MORE — set it on the
+      # curipet-api stack instead. The subscription webhook still ARRIVES here
+      # (only this container is routed publicly), but this app now forwards the
+      # raw bytes to the API and verifies nothing; the API holds the secret
+      # because it owns the database the webhook writes to.
+      #
+      # Left declared, and blank-tolerant, only so an existing Dockhand value
+      # does not break the stack during the cutover: the app logs a line at boot
+      # telling the operator to move it. Delete this line once it is set on
+      # curipet-api.
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      # Connect stays here in full — separate endpoint, separate secret, and it
+      # shares no code with the subscription rail that moved.
       STRIPE_CONNECT_WEBHOOK_SECRET: ${STRIPE_CONNECT_WEBHOOK_SECRET}
       STRIPE_PRODUCT_ID: ${STRIPE_PRODUCT_ID}
+      # THE HOSTED PAYMENT LINKS, moved out of the browser bundle.
+      # These were hardcoded (live-mode) in SubscribePage.tsx, so one image could
+      # never be pointed at a test account and clicking a plan always charged a
+      # real card. Set per deployment; LEAVE BLANK to route checkout through
+      # POST /api/stripe/checkout instead, which uses this app's own key and
+      # keeps the duplicate-subscription 409 a Payment Link skips.
+      STRIPE_PAYMENT_LINK_MONTH: ${STRIPE_PAYMENT_LINK_MONTH:-}
+      STRIPE_PAYMENT_LINK_YEAR: ${STRIPE_PAYMENT_LINK_YEAR:-}
 
       # Ops health probe (GET /api/ops/health)
       OPS_HEALTH_TOKEN: ${OPS_HEALTH_TOKEN}
