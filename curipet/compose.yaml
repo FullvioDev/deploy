@@ -46,6 +46,12 @@ services:
       STRIPE_PAYMENT_LINK_MONTH: ${STRIPE_PAYMENT_LINK_MONTH:-}
       STRIPE_PAYMENT_LINK_YEAR: ${STRIPE_PAYMENT_LINK_YEAR:-}
 
+      # "Sign in with Google" — the OAuth client id (Google Cloud Console,
+      # type Web application, curipet.com in Authorised JavaScript origins).
+      # Blank: the button never renders and /api/auth/google answers 503;
+      # everything else runs unaffected.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+
       # Ops health probe (GET /api/ops/health)
       OPS_HEALTH_TOKEN: ${OPS_HEALTH_TOKEN}
 
