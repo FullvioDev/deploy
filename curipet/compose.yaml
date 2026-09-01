@@ -74,6 +74,11 @@ services:
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER}
       SMTP_PASS: ${SMTP_PASS}
+      # The visible sender on notification mail, when it should differ from the
+      # mailbox the app logs into (e.g. a no-reply@ front for a shared inbox).
+      # Blank falls back to SMTP_USER, which is the behaviour that shipped
+      # before per-category notification e-mail existed.
+      MAIL_FROM: ${MAIL_FROM:-}
       DEMO_LEAD_RECIPIENTS: ${DEMO_LEAD_RECIPIENTS}
 
       # WhatsApp Business Cloud API (Meta)
