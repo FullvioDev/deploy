@@ -57,6 +57,9 @@ services:
 
       # AI chat (n8n)
       N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL}
+      # Breed recognition from the pet photo (second n8n workflow, same CF token).
+      # Blank: the form still takes a photo, it just never suggests a breed.
+      N8N_BREED_WEBHOOK_URL: ${N8N_BREED_WEBHOOK_URL:-}
       CF_ACCESS_CLIENT_ID: ${CF_ACCESS_CLIENT_ID}
       CF_ACCESS_CLIENT_SECRET: ${CF_ACCESS_CLIENT_SECRET}
 
