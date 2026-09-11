@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
     # Without this the JVM's -XX:MaxRAMPercentage=75.0 claims 75% of the HOST's
     # RAM, not the container's — see the Dockerfile ENTRYPOINT.
-    mem_limit: 512m
+    mem_limit: 1024mi
     ports:
       - "${CURIPET_API_PORT:-8080}:8080"
     environment:
