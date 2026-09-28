@@ -1,0 +1,23 @@
+# Weekly image updater for hosts that Dockhand does not manage: no Hawser
+# agent, or a stack brought up by hand with `docker compose` (the local.env
+# hosts in FullvioDev/config). Dockhand-managed hosts do not need this; use
+# Settings > Environments > <env> > Updates > automatic image updates there.
+#
+# Only containers labelled com.centurylinklabs.watchtower.enable=true are
+# touched (WATCHTOWER_LABEL_ENABLE). deploy/twingate carries that label;
+# nothing else on the host is looked at. Twingate documents this setup at
+# https://www.twingate.com/docs/docker.
+services:
+  watchtower:
+    # Maintained fork of containrrr/watchtower (github.com/nicholas-fedor/watchtower).
+    image: nickfedor/watchtower:${TAG:-1.22.3}
+    container_name: ${CNTNR:-watchtower}
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_CLEANUP=true
+      # Six-field cron, seconds first. Default: Monday 04:00 in TZ.
+      - WATCHTOWER_SCHEDULE=${SCHEDULE:-0 0 4 * * 1}

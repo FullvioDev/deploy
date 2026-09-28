@@ -2,7 +2,18 @@ services:
   twingate_connector:
     container_name: ${CNTNR:-twingate_connector}
     restart: always
-    image: twingate/connector:${TAG:-1.89.0}
+    # Floating major tag, as Twingate recommends for Docker connectors
+    # (https://www.twingate.com/docs/docker). A pinned x.y.z tag never changes
+    # digest, so no scheduled updater (Dockhand auto-update, Watchtower) can
+    # ever find a newer image behind it. `1` follows every 1.x release.
+    # Set TAG= in the stack env only to pin a host on purpose.
+    image: twingate/connector:${TAG:-1}
+    # Re-pull on every `compose up`, so a plain redeploy also lands the newest 1.x.
+    pull_policy: always
+    labels:
+      # Opt-in for the label-scoped Watchtower in deploy/watchtower, used on
+      # hosts Dockhand does not manage. Inert everywhere else.
+      - com.centurylinklabs.watchtower.enable=true
     environment:
       - TWINGATE_NETWORK=${NETWORK}
       - TWINGATE_ACCESS_TOKEN=${TWINGATE_ACCESS_TOKEN}
