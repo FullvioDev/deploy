@@ -1,0 +1,43 @@
+# Curipack — the breeders' community web app. A bundle of static files and
+# nothing else: Vite builds it, nginx serves it. The API it talks to is the
+# separate curipack-api stack.
+services:
+  curipack:
+    image: ghcr.io/fullviodev/curipack:${CURIPACK_IMAGE_TAG:-latest}
+    container_name: ${CURIPACK_CNTNR:-curipack}
+    restart: unless-stopped
+    # 8091 because 8090 is curipet and 8080 is curipet-api on this host. The
+    # container listens on 3000, which is what the Traefik record for Curipack
+    # points at.
+    ports:
+      - "${CURIPACK_HTTP_PORT:-8091}:3000"
+
+    # THERE IS DELIBERATELY NO `environment:` HERE, and adding one will not work.
+    #
+    # Everything this app is configured by — which Curipet it signs people in
+    # against, where its API is — is a VITE_* value, and Vite compiles those into
+    # the JavaScript bundle at BUILD time. By the time this container starts
+    # there is nothing left to read them. Setting VITE_CURIPET_ENV in Dockhand
+    # has no effect whatsoever.
+    #
+    # They live as ARG defaults in the Dockerfile in FullvioDev/Curipack, set for
+    # production. To change where this app sends people, change them there and
+    # run the "Build and push image" workflow; pulling a new tag here is the
+    # second half of that, not an alternative to it.
+    #
+    # Which image is running: `docker exec <container> printenv CURIPACK_GIT_SHA`
+    # answers it — CI bakes the commit in, the same way the Curipet image does.
+
+    # /api is NOT served by this container: it answers 404 for it on purpose, so
+    # that a missing edge route reads as a routing problem rather than as the SPA
+    # returning HTML to a fetch() that wanted JSON. The Traefik record has to
+    # send /api to curipack-api.
+
+    # No volumes: every file in the image is static and nothing is written at
+    # run time.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
