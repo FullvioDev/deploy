@@ -1,29 +1,72 @@
-# CuripackAPI — the community's API.
+# CuripackAPI — the community's API, and the PostgreSQL holding it.
 #
-# NO DATABASE, AND THAT IS NOT AN OMISSION HERE. This service has no JPA, JDBC,
-# Postgres or Flyway dependency at all: posts, reactions and sessions live in a
-# ConcurrentHashMap in the process. So unlike curipet-api there is no postgres
-# service and no volume to mount, and — read this before going live —
-# EVERY POST AND EVERY SIGN-IN IS LOST WHEN THIS CONTAINER RESTARTS. A pull of a
-# new image tag empties the community. That is a property of the application as
-# it stands today, not of this stack; it needs persistence in CuripackAPI before
-# the content here is worth keeping.
+# The posts used to live in a ConcurrentHashMap, so every restart emptied the
+# community and a pull of a new image tag was indistinguishable from deleting
+# everything anyone had written. CuripackAPI now stores them in PostgreSQL, so
+# this stack carries a database of its own, laid out the same way curipet-api's
+# is.
+#
+# ONE THING STILL DOES NOT SURVIVE A RESTART: sessions, if
+# CURIPACK_SESSION_SECRET is blank. See the note on it below — it is worth
+# setting now in a way it was not when the posts went too.
+#
+# REQUIRES POSTGRES_PASSWORD, which has no default here. Compose substitutes an
+# unset variable as an empty string, and an empty password is a quieter way to
+# end up with a database that trusts anything on its network than anyone would
+# choose deliberately.
 services:
+  postgres:
+    image: postgres:${POSTGRES_IMAGE:-16-alpine}
+    container_name: ${POSTGRES_CNTNR:-curipack_api_postgres}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-curipack}
+      POSTGRES_USER: ${POSTGRES_USER:-curipack}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      # A bind mount under the stack directory, as curipet-api does it, so the
+      # data is somewhere an operator can find and back up rather than in a
+      # named volume. SEPARATE FROM curipet-api's: two databases on one host,
+      # each owned by the service that migrates it. Pointing both at one
+      # directory would have two PostgreSQL containers fight over one data
+      # directory, and the second one to start would refuse.
+      - ${CURIPACK_API_DIR:-/home/administrator/curipack-api}/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-curipack} -d ${POSTGRES_DB:-curipack}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   api:
     image: ghcr.io/fullviodev/curipack-api:${CURIPACK_API_IMAGE_TAG:-latest}
     container_name: ${CURIPACK_API_CNTNR:-curipack-api}
     restart: unless-stopped
     # Without this the JVM's -XX:MaxRAMPercentage=75.0 claims 75% of the HOST's
-    # RAM, not the container's — same reason curipet-api sets it. Lower than that
-    # stack's 1024m because there is no database layer here; the service runs at
-    # roughly 190 MB resident.
-    mem_limit: 512m
+    # RAM, not the container's — same reason curipet-api sets it. Raised to
+    # curipet-api's 1024m along with the database: the 512m here was justified by
+    # "there is no database layer", and there now is one — Hibernate, a Hikari
+    # pool and Flyway. 512m would leave the heap at 384m, which is probably still
+    # enough and is not worth finding out the hard way on a restart.
+    mem_limit: 1024m
     # 8081 because 8080 is curipet-api and 8090 is curipet on this host. The
     # container listens on 8090, which is what application.yml defaults to.
     ports:
       - "${CURIPACK_API_PORT:-8081}:8090"
     environment:
       SERVER_PORT: "8090"
+
+      # `postgres` is this stack's hostname for the service above. The image's own
+      # default points at localhost, which inside a container is the container.
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-curipack}
+      DB_USER: ${POSTGRES_USER:-curipack}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      # Flyway builds the schema at startup and Hibernate then validates against
+      # it. Leaving this alone is almost always right: switching migrations off
+      # on a database that is not already current makes the service refuse to
+      # start, which is the intended outcome and not a reason to loosen the
+      # validation too.
+      # FLYWAY_ENABLED: "true"
 
       # REQUIRED. Curipet's signing key, BYTE-IDENTICAL to the JWT_SECRET of the
       # Curipet deployment members sign in at — the same value the curipet and
@@ -44,6 +87,11 @@ services:
       # Left blank the service generates a random key per process and logs a
       # warning, which means everyone is signed out every time this container
       # restarts, however long CURIPACK_SESSION_TTL says a session lasts.
+      #
+      # This matters more than it used to. While the posts were in memory a
+      # restart emptied the community anyway, so losing the sessions with them
+      # was merely consistent. The posts now survive, and this is the only thing
+      # left that does not.
       CURIPACK_SESSION_SECRET: ${CURIPACK_SESSION_SECRET:-}
 
       # How long an issued session is accepted, ISO-8601. There is no refresh:
@@ -62,12 +110,23 @@ services:
       # the contract does not need publishing with it.
       SPRINGDOC_APIDOCS_ENABLED: ${SPRINGDOC_APIDOCS_ENABLED:-false}
       SPRINGDOC_SWAGGERUI_ENABLED: ${SPRINGDOC_SWAGGERUI_ENABLED:-false}
-    # /api/categories rather than a health endpoint, because there is no health
-    # endpoint: no actuator dependency and nothing hand-written. It is the
-    # cheapest honest probe available — a fixed in-memory catalogue, served
-    # unauthenticated, that answers 200 only once the context is up.
+    depends_on:
+      postgres:
+        # Waits for pg_isready, not merely for the container to exist. Flyway is
+        # the first thing this service does and it cannot retry a database that
+        # is still starting up.
+        condition: service_healthy
+    # /api/health, which this service does have — the note that used to be here
+    # said there was no health endpoint and no actuator and so probed
+    # /api/categories instead. SystemController serves GET /api/health, declared
+    # in openapi.yaml, returning {"status":"ok"}.
+    #
+    # Like /api/categories it is a static answer and touches no database, so it
+    # does not prove the database is reachable. That is fine as a container
+    # probe: Flyway runs before the web server accepts anything, so a service
+    # that cannot reach its database never answers this at all.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/api/categories || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/api/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
