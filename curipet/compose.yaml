@@ -9,6 +9,12 @@ services:
       NODE_ENV: production
       PORT: "5000"
       APP_URL: ${APP_URL}
+
+      # Environment label appended to the page title, so a tab open on this
+      # deployment is not mistaken for production. Blank/unset on prod; set to
+      # " - TEST" on the test stack in Dockhand. Read at runtime, so the same
+      # image serves both and the artifact that ships is the one that was tested.
+      SITE_TITLE_SUFFIX: ${SITE_TITLE_SUFFIX:-}
       SESSION_SECRET: ${SESSION_SECRET}
       TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-2}
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
