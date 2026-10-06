@@ -10,10 +10,14 @@
 # CURIPACK_SESSION_SECRET is blank. See the note on it below — it is worth
 # setting now in a way it was not when the posts went too.
 #
-# REQUIRES POSTGRES_PASSWORD, which has no default here. Compose substitutes an
-# unset variable as an empty string, and an empty password is a quieter way to
-# end up with a database that trusts anything on its network than anyone would
-# choose deliberately.
+# REQUIRES POSTGRES_PASSWORD, and says so with `:?` rather than leaving it to
+# interpolate. The bare `${POSTGRES_PASSWORD}` that curipet-api uses only prints
+# a warning and substitutes an empty string; what then stops an open database is
+# the postgres image's own entrypoint, which refuses to INITIALISE without a
+# password — so the mistake is caught on a new stack but not on one whose data
+# directory already exists, where postgres starts happily and it is the API that
+# fails to authenticate. `:?` fails the whole stack immediately, naming the
+# variable, in both cases.
 services:
   postgres:
     image: postgres:${POSTGRES_IMAGE:-16-alpine}
@@ -22,7 +26,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-curipack}
       POSTGRES_USER: ${POSTGRES_USER:-curipack}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD on this stack}
     volumes:
       # A bind mount under the stack directory, as curipet-api does it, so the
       # data is somewhere an operator can find and back up rather than in a
@@ -60,7 +64,7 @@ services:
       # default points at localhost, which inside a container is the container.
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-curipack}
       DB_USER: ${POSTGRES_USER:-curipack}
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD on this stack}
       # Flyway builds the schema at startup and Hibernate then validates against
       # it. Leaving this alone is almost always right: switching migrations off
       # on a database that is not already current makes the service refuse to
