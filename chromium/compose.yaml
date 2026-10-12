@@ -1,0 +1,96 @@
+# Five independent remote Chromium browsers, each opened on its own page.
+# Watch and drive each one from your own browser at https://<host-ip>:<port>/.
+#
+#   URL_1 -> https://<host-ip>:3101/      URL_4 -> https://<host-ip>:3104/
+#   URL_2 -> https://<host-ip>:3102/      URL_5 -> https://<host-ip>:3105/
+#   URL_3 -> https://<host-ip>:3103/
+#
+# One container per page, each with its own profile in ${DIR}/<n>: its own
+# cookies, logins, storage and cache. Signing in or out in one browser does
+# nothing to the others, and a site cannot match them up by cookie.
+#
+# What they still share: this host's public IP address, and an identical
+# browser (same Chromium build, same fonts, same virtual hardware). A site that
+# groups visitors by IP or by browser fingerprint sees five visits from one
+# machine.
+#
+# HTTPS, not HTTP: the image (linuxserver/chromium, Selkies-based) streams the
+# screen with WebCodecs, which browsers only allow on a secure page. The
+# certificate is self-signed, so expect a warning the first time on each port.
+# The image's plain-HTTP port 3000 is meant for a reverse proxy only and is not
+# published.
+#
+# Anyone who reaches a port gets a working browser on this host's network, with
+# whatever is signed in inside it. That is why CUSTOM_USER and PASSWORD (HTTP
+# basic auth) are required.
+#
+# Budget about 1 GB of RAM per browser, more for heavy pages.
+x-chromium: &chromium
+  image: lscr.io/linuxserver/chromium:${TAG:-latest}
+  restart: unless-stopped
+  # A ceiling on /dev/shm, not memory set aside: only what Chromium actually
+  # writes there uses RAM. The image's docs: modern sites break without it.
+  shm_size: "1gb"
+
+x-env: &env
+  PUID: ${PUID:-1000}
+  PGID: ${PGID:-1000}
+  TZ: ${TZ:-Etc/UTC}
+  CUSTOM_USER: ${CUSTOM_USER:?set CUSTOM_USER for the viewer login}
+  PASSWORD: ${PASSWORD:?set PASSWORD for the viewer login}
+
+services:
+  chromium-1:
+    <<: *chromium
+    container_name: ${CNTNR:-chromium}-1
+    ports:
+      - "${PORT_1:-3101}:3001"
+    environment:
+      <<: *env
+      CHROME_CLI: ${URL_1:?set URL_1 to the page browser 1 opens}
+    volumes:
+      - ${DIR:-/home/administrator/chromium}/1:/config
+
+  chromium-2:
+    <<: *chromium
+    container_name: ${CNTNR:-chromium}-2
+    ports:
+      - "${PORT_2:-3102}:3001"
+    environment:
+      <<: *env
+      CHROME_CLI: ${URL_2:?set URL_2 to the page browser 2 opens}
+    volumes:
+      - ${DIR:-/home/administrator/chromium}/2:/config
+
+  chromium-3:
+    <<: *chromium
+    container_name: ${CNTNR:-chromium}-3
+    ports:
+      - "${PORT_3:-3103}:3001"
+    environment:
+      <<: *env
+      CHROME_CLI: ${URL_3:?set URL_3 to the page browser 3 opens}
+    volumes:
+      - ${DIR:-/home/administrator/chromium}/3:/config
+
+  chromium-4:
+    <<: *chromium
+    container_name: ${CNTNR:-chromium}-4
+    ports:
+      - "${PORT_4:-3104}:3001"
+    environment:
+      <<: *env
+      CHROME_CLI: ${URL_4:?set URL_4 to the page browser 4 opens}
+    volumes:
+      - ${DIR:-/home/administrator/chromium}/4:/config
+
+  chromium-5:
+    <<: *chromium
+    container_name: ${CNTNR:-chromium}-5
+    ports:
+      - "${PORT_5:-3105}:3001"
+    environment:
+      <<: *env
+      CHROME_CLI: ${URL_5:?set URL_5 to the page browser 5 opens}
+    volumes:
+      - ${DIR:-/home/administrator/chromium}/5:/config
