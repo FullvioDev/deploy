@@ -19,6 +19,19 @@ services:
       CURIPET_API_URL: ${CURIPET_API_URL}
       CURIPET_API_PUBLIC_URL: ${CURIPET_API_PUBLIC_URL}
       JWT_SECRET: ${JWT_SECRET}
+      # The other half of the Curipack handoff, and the switch that turns it on.
+      # server/curipackSso.ts reads this per request: unset or empty means no
+      # origin may receive a CuriPet identity, so /sso/curipack answers 503 and
+      # mints nothing. Undeclared here it could not be set at all — a Dockhand
+      # value only reaches the container through a line like this one, which is
+      # why the stack answered 503 with the variable apparently set.
+      #
+      # No default, deliberately. Curipet's rule is that an origin can only ever
+      # receive a token because an operator named it, so each stack names its
+      # own: the test stack gets the test Curipack origin, prod gets prod's.
+      # Deriving it from APP_URL would hand a token to an origin nobody chose.
+      # Comma-separated; entries are matched on origin only.
+      CURIPACK_SSO_ORIGINS: ${CURIPACK_SSO_ORIGINS:-}
 
       # Stripe (B2C paywall + Connect)
       # Checkout and Billing Portal sessions, and the whole Connect rail.
