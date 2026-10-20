@@ -55,6 +55,8 @@ services:
     image: lscr.io/linuxserver/chromium:${TAG:-latest}
     container_name: ${CNTNR:-chromium}
     restart: unless-stopped
+    # No `ports:` here: this container uses vpn's network, so its port 3001 is
+    # published by `vpn` above. Docker refuses ports on a network_mode service.
     network_mode: "service:vpn"
     depends_on:
       vpn:
