@@ -2495,23 +2495,23 @@ configs:
               page = ctx.pages[0] if ctx.pages else ctx.new_page()
               stealth_sync(page)
               page.add_init_script("""
-(() => {
-  const getParameter = WebGLRenderingContext.prototype.getParameter;
-  WebGLRenderingContext.prototype.getParameter = function(parameter) {
-    if (parameter === 37445) return 'Google Inc. (NVIDIA)';
-    if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)';
-    return getParameter.apply(this, arguments);
-  };
-  if (typeof WebGL2RenderingContext !== 'undefined') {
-    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-    WebGL2RenderingContext.prototype.getParameter = function(parameter) {
-      if (parameter === 37445) return 'Google Inc. (NVIDIA)';
-      if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)';
-      return getParameter2.apply(this, arguments);
-    };
-  }
-})();
-""")
+      (() => {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+          if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+          if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)';
+          return getParameter.apply(this, arguments);
+        };
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+          const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+          WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter2.apply(this, arguments);
+          };
+        }
+      })();
+      """)
 
               if len(sys.argv) > 1 and sys.argv[1] == "login":
                   page.goto("https://www.instagram.com/")
