@@ -2256,6 +2256,10 @@ configs:
       # bez tohto sa tzdata pýta na časové pásmo a build navždy visí
       ARG DEBIAN_FRONTEND=noninteractive
       RUN apt-get update && apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify openbox \
+          fonts-liberation fonts-liberation2 fonts-noto-core fonts-noto-ui-core \
+          fonts-noto-color-emoji fonts-dejavu-core fonts-dejavu-extra \
+          fonts-freefont-ttf fonts-ubuntu \
+          && fc-cache -f -v \
           && rm -rf /var/lib/apt/lists/*
       WORKDIR /app
       COPY requirements.txt .
@@ -2273,6 +2277,7 @@ configs:
 
       import psycopg2, psycopg2.extras, requests
       from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+      from playwright_stealth import stealth_sync
 
       ACCOUNT = os.environ["ACCOUNT_USERNAME"]
       DSN = os.environ["DATABASE_URL"]
@@ -2486,8 +2491,27 @@ configs:
           with sync_playwright() as p:
               ctx = p.chromium.launch_persistent_context(
                   PROFILE_DIR, headless=HEADLESS, proxy=proxy,
-                  locale=os.environ.get("LOCALE", "en-US"), viewport={"width": 1280, "height": 900})
+                  locale=os.environ.get("LOCALE", "en-US"), viewport={"width": 1920, "height": 1080})
               page = ctx.pages[0] if ctx.pages else ctx.new_page()
+              stealth_sync(page)
+              page.add_init_script("""
+(() => {
+  const getParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+    if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)';
+    return getParameter.apply(this, arguments);
+  };
+  if (typeof WebGL2RenderingContext !== 'undefined') {
+    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+      if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+      if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)';
+      return getParameter2.apply(this, arguments);
+    };
+  }
+})();
+""")
 
               if len(sys.argv) > 1 and sys.argv[1] == "login":
                   page.goto("https://www.instagram.com/")
@@ -2562,5 +2586,6 @@ configs:
   f_worker_requirements_txt:
     content: |
       playwright==1.48.0
+      playwright-stealth==1.0.6
       psycopg2-binary==2.9.9
       requests==2.32.3
