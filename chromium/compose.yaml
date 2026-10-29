@@ -7,7 +7,8 @@
 # Premenné prostredia (všetky v súbore .env, vzor .env.stack.example):
 #   povinné: DOMAIN, ADMIN_PASSWORD, POSTGRES_PASSWORD, WORKER_DB_PASSWORD, N8N_ENCRYPTION_KEY,
 #            COMMAND_KEY, APPROVAL_KEY, NOTIFY_URL, DATA_DIR (absolútna cesta na hostiteľovi)
-#   porty (ak sú obsadené): DB_PORT, N8N_PORT (obe len 127.0.0.1), HTTP_PORT, HTTPS_PORT (Caddy potrebuje 80/443 pre certifikát)
+#   porty: PUBLIC_PORT (kde je webové rozhranie, predvolene 443; napr. 2376 => https://DOMAIN:2376), HTTP_PORT (80, pre certifikát),
+#          DB_PORT, N8N_PORT (obe len 127.0.0.1); TLS_MODE=auto|internal (internal = vlastný certifikát, nepotrebuje 80/443 z internetu)
 #   voliteľné: NORDVPN_PRIVATE_KEY (alebo v GUI), VPN_COUNTRIES, VPN_CITIES, VPN_TAG, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY, LOCAL_LLM_MODEL + COMPOSE_PROFILES=llm,
 #              BLACKLIST_WORDS, IG_LOCALE, TZ, SEL_*, POST_LABEL
 # =====================================================================================
@@ -99,8 +100,8 @@ services:
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
       N8N_HOST: ${DOMAIN:?nastav DOMAIN}
       N8N_PROTOCOL: https
-      WEBHOOK_URL: https://${DOMAIN:?nastav DOMAIN}/
-      N8N_PUBLIC_URL: https://${DOMAIN:?nastav DOMAIN}/
+      WEBHOOK_URL: https://${DOMAIN:?nastav DOMAIN}:${PUBLIC_PORT:-443}/
+      N8N_PUBLIC_URL: https://${DOMAIN:?nastav DOMAIN}:${PUBLIC_PORT:-443}/
       NOTIFY_URL: ${NOTIFY_URL:?nastav NOTIFY_URL}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       COMMAND_KEY: ${COMMAND_KEY:?nastav COMMAND_KEY}
@@ -191,16 +192,21 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
-    ports: ["${HTTP_PORT:-80}:80", "${HTTPS_PORT:-443}:443", "${HTTPS_PORT:-443}:443/udp"]
+    ports: ["${HTTP_PORT:-80}:80", "${PUBLIC_PORT:-443}:${PUBLIC_PORT:-443}", "${PUBLIC_PORT:-443}:${PUBLIC_PORT:-443}/udp"]
     environment:
       DOMAIN: ${DOMAIN:?nastav DOMAIN}
+      PUBLIC_PORT: ${PUBLIC_PORT:-443}
+      TLS_MODE: ${TLS_MODE:-auto}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?nastav ADMIN_PASSWORD}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         HASH="$$(caddy hash-password --plaintext "$$ADMIN_PASSWORD")"
+        TLS_LINE=""
+        [ "$$TLS_MODE" = "internal" ] && TLS_LINE="tls internal"
         cat > /etc/caddy/Caddyfile <<EOF
-        $$DOMAIN {
+        https://$$DOMAIN:$$PUBLIC_PORT {
+            $$TLS_LINE
             @hooks path /webhook/* /webhook-test/*
             handle @hooks {
                 reverse_proxy n8n:5678
