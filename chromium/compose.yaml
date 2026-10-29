@@ -1,7 +1,8 @@
 # =====================================================================================
 # IG Brand Agents v1.2.0 – jednosúborový stack (vygenerované: python3 tools/build_stack.py)
-# VARIANTA PRE DOCKHAND: obrazy sa v stacku NEBUDUJÚ cez `build`; zostaví ich služba image-builder pri prvom nasadení
-# (5 - 15 min). Nasadenie:  docker compose -f docker-compose.dockhand.yml --env-file .env up -d
+# VARIANTA PRE DOCKHAND / PORTAINER: žiadny `build` ani vlastný obraz v stacku. Manažér beží na verejnom obraze python:3.12-slim
+# (kód je v configs), obraz workera si zostaví sám pri prvom štarte (5 - 15 min; priebeh vidno v rozhraní).
+# Nasadenie:  docker compose -f docker-compose.dockhand.yml --env-file .env up -d
 # Vyžaduje Docker Compose >= 2.24 (configs.content). Návod: DOCKHAND.md
 # Premenné prostredia (všetky v súbore .env, vzor .env.stack.example):
 #   povinné: DOMAIN, ADMIN_PASSWORD, POSTGRES_PASSWORD, WORKER_DB_PASSWORD, N8N_ENCRYPTION_KEY,
@@ -22,6 +23,7 @@ volumes:
   caddydata:
   caddyconfig:
   ollamadata:
+  managerdeps:
 
 services:
 
@@ -108,26 +110,20 @@ services:
     depends_on:
       n8n-init: {condition: service_completed_successfully}
 
-  # ---- jednorazovo zostaví lokálne obrazy ig-manager a ig-worker (ak ešte neexistujú); skončí s kódom 0 ----
-  image-builder:
-    image: docker:cli
-    restart: "no"
-    entrypoint: ["/bin/sh", "/ig-build-images.sh"]
-    environment:
-      FORCE_REBUILD: ${FORCE_REBUILD:-0}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    configs:
-      - source: build_script
-        target: /ig-build-images.sh
-        mode: 0755
-
   # ---- webové rozhranie + správa workerov + AI vrstva ----
   manager:
-    image: ig-manager:1.2.0
-    pull_policy: never          # obraz zostaví služba image-builder
+    image: python:3.12-slim
+    working_dir: /app
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        pip install --no-cache-dir --target /deps -r /app/requirements.txt
+        exec python -m uvicorn app:app --host 0.0.0.0 --port 8000
     restart: unless-stopped
     environment:
+      PYTHONPATH: /deps
+      WORKER_SRC: /worker-src
+      BUILDER_IMAGE: docker:cli
       DATABASE_URL: postgresql://igagents:${POSTGRES_PASSWORD:?nastav POSTGRES_PASSWORD}@postgres:5432/igagents
       WORKER_DATABASE_URL: postgresql://ig_worker:${WORKER_DB_PASSWORD:?nastav WORKER_DB_PASSWORD}@postgres:5432/igagents
       N8N_URL: http://n8n:5678
@@ -150,14 +146,46 @@ services:
       LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-}
     extra_hosts: ["host.docker.internal:host-gateway"]
     volumes:
+      - managerdeps:/deps
       - /var/run/docker.sock:/var/run/docker.sock
       - ${DATA_DIR:?nastav DATA_DIR}:/data-root
     configs:
       - source: boss_prompt
         target: /prompts/boss_agent.md
+      - source: f_manager_app_py
+        target: /app/app.py
+      - source: f_manager_llm_py
+        target: /app/llm.py
+      - source: f_manager_requirements_txt
+        target: /app/requirements.txt
+      - source: f_manager_templates_account_html
+        target: /app/templates/account.html
+      - source: f_manager_templates_ai_html
+        target: /app/templates/ai.html
+      - source: f_manager_templates_base_html
+        target: /app/templates/base.html
+      - source: f_manager_templates_dashboard_html
+        target: /app/templates/dashboard.html
+      - source: f_manager_templates_login_html
+        target: /app/templates/login.html
+      - source: f_manager_templates_logs_html
+        target: /app/templates/logs.html
+      - source: f_manager_templates_settings_html
+        target: /app/templates/settings.html
+      - source: f_manager_templates_tasks_html
+        target: /app/templates/tasks.html
+      - source: f_manager_templates_vpn_html
+        target: /app/templates/vpn.html
+      - source: f_worker_Dockerfile
+        target: /worker-src/Dockerfile
+      - source: f_worker_worker_py
+        target: /worker-src/worker.py
+      - source: f_worker_login_sh
+        target: /worker-src/login.sh
+      - source: f_worker_requirements_txt
+        target: /worker-src/requirements.txt
     depends_on:
       postgres: {condition: service_healthy}
-      image-builder: {condition: service_completed_successfully}
 
   # ---- HTTPS + heslo (Caddyfile sa vygeneruje pri štarte z DOMAIN a ADMIN_PASSWORD) ----
   caddy:
@@ -1008,34 +1036,10 @@ configs:
         "id": "igreset",
         "active": false
       }
-  build_script:
+  f_manager_app_py:
     content: |
-      #!/bin/sh
-      # Zostaví lokálne obrazy ig-manager:1.2.0 a ig-worker:1.2.0 (vygenerované: python3 tools/build_stack.py).
-      # Beží automaticky v službe `image-builder` stacku; dá sa spustiť aj ručne na serveri:  sh ig-build-images.sh
-      # Potrebuje len Docker (bežný `docker build`, buildx nie je nutný). Worker obraz je veľký, prvé zostavenie trvá 5 - 15 min.
-      # Ak obe obrazy už existujú, preskočí sa (vynútenie: FORCE_REBUILD=1).
-      set -eu
-      command -v docker >/dev/null || { echo "chýba docker"; exit 1; }
-      if [ "$${FORCE_REBUILD:-0}" != "1" ] && docker image inspect ig-manager:1.2.0 >/dev/null 2>&1 && docker image inspect ig-worker:1.2.0 >/dev/null 2>&1; then
-        echo "Obrazy ig-manager:1.2.0 a ig-worker:1.2.0 už existujú, preskakujem (FORCE_REBUILD=1 ich zostaví znova)."; exit 0
-      fi
-      D="$$(mktemp -d)"; trap 'rm -rf "$$D"' EXIT
-      mkdir -p "$$D/manager"
-      cat > "$$D/manager/Dockerfile" <<'__IG_EOF__'
-      FROM python:3.12-slim
-      WORKDIR /app
-      COPY requirements.txt .
-      RUN pip install --no-cache-dir -r requirements.txt
-      COPY app.py llm.py ./
-      COPY templates templates
-      EXPOSE 8000
-      CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-      __IG_EOF__
-      mkdir -p "$$D/manager"
-      cat > "$$D/manager/app.py" <<'__IG_EOF__'
       """Webové rozhranie (manager): správa účtov, workerov, úloh a schvaľovania."""
-      import hashlib, json, os, re, requests, time
+      import hashlib, io, json, os, re, requests, tarfile, threading, time
       from contextlib import asynccontextmanager
       import psycopg2, psycopg2.extras
       from fastapi import FastAPI, Form, HTTPException, Request
@@ -1061,6 +1065,9 @@ configs:
       COMMAND_KEY = os.environ.get("COMMAND_KEY", "")
       LOGIN_NAME = "ig-login"
       VPN_IMAGE = os.environ.get("VPN_IMAGE", "qmcgaw/gluetun:v3")
+      WORKER_SRC = os.environ.get("WORKER_SRC", "")          # priečinok so zdrojmi workera (Dockerfile, worker.py, login.sh, requirements.txt)
+      BUILDER_IMAGE = os.environ.get("BUILDER_IMAGE", "docker:cli")
+      build_state = {"status": "unknown", "log": ""}          # unknown | ready | building | failed
       VPN_PORT = 8888
       VPN_TEST = "ig-vpn-test"
       WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$$")
@@ -1088,6 +1095,7 @@ configs:
       @asynccontextmanager
       async def lifespan(_app):
           seed_from_env()
+          ensure_worker_image(background=True)
           yield
 
 
@@ -1121,6 +1129,7 @@ configs:
           ctx.setdefault("msg", request.query_params.get("msg"))
           ctx.setdefault("err", request.query_params.get("err"))
           ctx["docker_ok"] = dc is not None
+          ctx["worker_build"] = dict(build_state)
           return templates.TemplateResponse(request, name, ctx)
 
 
@@ -1142,6 +1151,78 @@ configs:
               health = c.attrs.get("State", {}).get("Health", {}).get("Status")
               out[c.labels.get("ig.account")] = c.status + (f" ({health})" if health and c.status == "running" else "")
           return out
+
+
+      def worker_image_ready():
+          if not dc: return False
+          try:
+              dc.images.get(IMAGE); return True
+          except docker.errors.ImageNotFound:
+              return False
+          except Exception:
+              return False
+
+
+      def _src_tar():
+          """Zdroje workera ako tar pre kontajner zostavovača (priečinok /src)."""
+          buf = io.BytesIO()
+          with tarfile.open(fileobj=buf, mode="w") as t:
+              d = tarfile.TarInfo("src"); d.type = tarfile.DIRTYPE; d.mode = 0o755; t.addfile(d)
+              for name in ("Dockerfile", "worker.py", "login.sh", "requirements.txt"):
+                  data = open(os.path.join(WORKER_SRC, name), "rb").read()
+                  ti = tarfile.TarInfo("src/" + name); ti.size = len(data); ti.mode = 0o755 if name.endswith(".sh") else 0o644
+                  t.addfile(ti, io.BytesIO(data))
+          buf.seek(0)
+          return buf.read()
+
+
+      def _build_worker_image():
+          build_state.update(status="building", log="Zostavuje sa obraz workera (prvýkrát 5 – 15 min)…")
+          name = "ig-worker-builder"
+          try:
+              remove_container(name)
+              try: dc.images.get(BUILDER_IMAGE)
+              except docker.errors.ImageNotFound:
+                  build_state["log"] = f"Sťahujem {BUILDER_IMAGE}…"; dc.images.pull(BUILDER_IMAGE)
+                  build_state["log"] = "Zostavuje sa obraz workera (5 – 15 min)…"
+              c = dc.containers.create(BUILDER_IMAGE, name=name, working_dir="/src", entrypoint=["/bin/sh", "-c"],
+                                       command=[f"docker build -t {IMAGE} ."],
+                                       volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}})
+              c.put_archive("/", _src_tar())
+              c.start()
+              res = c.wait()
+              code = res.get("StatusCode", 1) if isinstance(res, dict) else 1
+              tail = c.logs(tail=15).decode(errors="ignore")[-900:]
+              remove_container(name)
+              if code == 0 and worker_image_ready():
+                  build_state.update(status="ready", log="")
+              else:
+                  build_state.update(status="failed", log=f"Zostavenie obrazu zlyhalo (kód {code}): {tail}")
+          except Exception as e:
+              build_state.update(status="failed", log=f"Zostavenie obrazu zlyhalo: {e}")
+
+
+      def ensure_worker_image(background=True):
+          """Ak obraz workera neexistuje a sú dostupné zdroje, zostaví ho (na pozadí). Inak len zistí stav."""
+          if not dc:
+              return
+          if worker_image_ready():
+              build_state.update(status="ready", log=""); return
+          if not WORKER_SRC or not os.path.isfile(os.path.join(WORKER_SRC, "Dockerfile")):
+              build_state.update(status="failed", log=f"Obraz {IMAGE} neexistuje a nie sú dostupné zdroje na jeho zostavenie."); return
+          if build_state["status"] == "building":
+              return
+          if background:
+              threading.Thread(target=_build_worker_image, daemon=True).start()
+          else:
+              _build_worker_image()
+
+
+      def require_worker_image():
+          if worker_image_ready(): return
+          if build_state["status"] == "building":
+              raise RuntimeError("Obraz workera sa ešte zostavuje (5 – 15 min pri prvom štarte). Skús to neskôr.")
+          raise RuntimeError("Obraz workera neexistuje. Na stránke Prehľad ho spusti zostaviť. " + build_state.get("log", ""))
 
 
       def vname(u): return f"ig-vpn-{u}"
@@ -1263,6 +1344,7 @@ configs:
       def start_worker(acc):
           """Spustí VPN (ak je zapnutá) a worker účtu. Vráti prípadné varovanie."""
           if not dc: raise RuntimeError("Docker nie je dostupný")
+          require_worker_image()
           u = acc["ig_username"]
           proxy, ip = vpn_up(acc)
           remove_container(wname(u))
@@ -1320,6 +1402,14 @@ configs:
           if hostname and not re.match(r"^[a-z0-9.-]+\.nordvpn\.com$$", hostname):
               raise ValueError("Hostname servera musí mať tvar napr. sk123.nordvpn.com")
           return mode, country, city, hostname
+
+
+      @app.post("/system/build-worker")
+      def rebuild_worker_image():
+          if build_state["status"] == "building": return back("/", msg="Obraz sa už zostavuje.")
+          build_state["status"] = "unknown"
+          ensure_worker_image(background=True)
+          return back("/", msg="Zostavovanie obrazu workera spustené.")
 
 
       @app.post("/accounts/add")
@@ -1428,6 +1518,8 @@ configs:
       @app.post("/accounts/{aid}/login")
       def login_start(aid: int):
           if not dc: return back("/", err="Docker nie je dostupný")
+          try: require_worker_image()
+          except RuntimeError as e: return back("/", err=str(e))
           acc = get_acc(aid)
           u = acc["ig_username"]
           stop_remove(LOGIN_NAME)
@@ -1772,9 +1864,8 @@ configs:
       def setting_delete(table: str, rid: int):
           if table == "black": db("DELETE FROM blacklist WHERE id=%s", (rid,))
           return back("/settings", msg="Odstránené.")
-      __IG_EOF__
-      mkdir -p "$$D/manager"
-      cat > "$$D/manager/llm.py" <<'__IG_EOF__'
+  f_manager_llm_py:
+    content: |
       """Jednotné rozhranie na AI modely: Anthropic (Claude) a ľubovoľné OpenAI-kompatibilné API
       (OpenAI, OpenRouter, ale aj lokálne: Ollama, LM Studio, vLLM, llama.cpp server)."""
       import json, re, time
@@ -1851,9 +1942,8 @@ configs:
               return sorted(m["id"] for m in r.json().get("data", []))[:200]
           except Exception:
               return []
-      __IG_EOF__
-      mkdir -p "$$D/manager"
-      cat > "$$D/manager/requirements.txt" <<'__IG_EOF__'
+  f_manager_requirements_txt:
+    content: |
       fastapi==0.115.0
       uvicorn==0.30.6
       jinja2==3.1.4
@@ -1861,9 +1951,8 @@ configs:
       psycopg2-binary==2.9.9
       docker==7.1.0
       requests==2.32.3
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/account.html" <<'__IG_EOF__'
+  f_manager_templates_account_html:
+    content: |
       {% extends "base.html" %}{% block body %}
       <div class="card"><h2>Účet {{ a.ig_username }}</h2>
       <form method="post" action="/accounts/{{ a.id }}/edit">
@@ -1890,9 +1979,8 @@ configs:
       <label style="display:inline"><input type="checkbox" name="confirm" style="width:auto" required> Rozumiem, worker sa zastaví a čakajúce úlohy sa zrušia (história ostane).</label>
       <p><button class="d">Odstrániť</button></p></form></div>
       {% endblock %}
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/ai.html" <<'__IG_EOF__'
+  f_manager_templates_ai_html:
+    content: |
       {% extends "base.html" %}{% set nav='ai' %}{% block body %}
       <div class="card"><h2>AI model šéf-agenta</h2>
       <p><small>Model premení tvoj príkaz na úlohy. Bezpečnostné pravidlá (limity, blacklist, aktívne účty, formát odkazov, schvaľovanie komentárov) sa kontrolujú v kóde, nie v modeli, takže slabší model nemôže obísť ochrany. Modelu sa posiela: príkaz, mená aktívnych účtov so zostávajúcimi limitmi, blacklist a posledné texty komentárov. Pri lokálnom modeli neodchádza nič mimo tvoj server.</small></p>
@@ -1925,9 +2013,8 @@ configs:
       function preset(p,u,m){document.getElementById('provider').value=p;document.getElementById('base_url').value=u;if(m)document.getElementById('model').value=m;}
       </script>
       {% endblock %}
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/base.html" <<'__IG_EOF__'
+  f_manager_templates_base_html:
+    content: |
       <!doctype html>
       <html lang="sk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
       <title>IG Brand Agents</title>
@@ -1959,12 +2046,14 @@ configs:
       <a href="/logs" class="{{ 'on' if nav=='logs' }}">Logy</a><a href="/settings" class="{{ 'on' if nav=='set' }}">Nastavenia</a><a href="/settings/ai" class="{{ 'on' if nav=='ai' }}">AI model</a><a href="/settings/vpn" class="{{ 'on' if nav=='vpn' }}">VPN</a></header>
       <main>
       {% if msg %}<div class="flash m">{{ msg }}</div>{% endif %}{% if err %}<div class="flash e">{{ err }}</div>{% endif %}
+      {% if worker_build.status == 'building' %}<div class="flash e" style="background:rgba(183,121,31,.15);color:var(--warn)">⏳ {{ worker_build.log }} Kým nie je hotové, nejde spustiť workery ani prihlásenie účtov. Stránka sa obnovuje.</div><meta http-equiv="refresh" content="20">
+      {% elif worker_build.status == 'failed' %}<div class="flash e">Obraz workera nie je k dispozícii: {{ worker_build.log }}
+      <form method="post" action="/system/build-worker" style="margin-top:8px"><button>Zostaviť znova</button></form></div>{% endif %}
       {% if not docker_ok %}<div class="flash e">Docker nie je dostupný – správa workerov je vypnutá.</div>{% endif %}
       {% block body %}{% endblock %}
       </main></body></html>
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/dashboard.html" <<'__IG_EOF__'
+  f_manager_templates_dashboard_html:
+    content: |
       {% extends "base.html" %}{% set nav='dash' %}{% set refresh=20 %}
       {% block body %}
       <div class="card"><div class="stats">
@@ -2018,9 +2107,8 @@ configs:
       <label style="display:inline"><input type="checkbox" name="external" value="1" style="width:auto"> worker pobeží na samostatnom VPS (docker-compose.worker.yml) – rozhranie ho len sleduje</label></p>
       <button class="p">Pridať účet</button> <small>Po pridaní klikni Prihlásiť, potom Aktivovať. Nový účet beží v dry-run, nič neodosiela.</small></form></details></div>
       {% endblock %}
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/login.html" <<'__IG_EOF__'
+  f_manager_templates_login_html:
+    content: |
       {% extends "base.html" %}{% block body %}
       <div class="card"><h2>Prihlásenie účtu {{ a.ig_username }}</h2>
       {% if state == 'running' %}
@@ -2030,18 +2118,16 @@ configs:
       {% else %}<p>Relácia sa ukončila (stav: {{ state }}). Klikni „Hotovo“.</p>{% endif %}
       <form method="post" action="/accounts/{{ a.id }}/login/done"><button class="p">Hotovo – spustiť worker</button> <a class="btn" href="/">Zrušiť</a></form></div>
       {% endblock %}
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/logs.html" <<'__IG_EOF__'
+  f_manager_templates_logs_html:
+    content: |
       {% extends "base.html" %}{% set nav='logs' %}{% set refresh=30 %}{% block body %}
       <div class="card"><h2>Posledné udalosti</h2><div class="tablewrap"><table><tr><th>Čas</th><th>Účet</th><th>Úloha</th><th>Udalosť</th><th>Chyba</th><th>Screenshot</th></tr>
       {% for r in rows %}<tr><td>{{ r.t }}</td><td>{{ r.ig_username or '' }}</td><td>{{ r.task_id or '' }}</td>
       <td class="{{ 'bad' if r.event in ('risk','failed','ambiguous') else ('ok' if r.event=='done' else '') }}">{{ r.event }}</td><td><small>{{ r.error }}</small></td>
       <td>{% if r.shot and r.ig_username %}<a href="/shots/{{ r.ig_username }}/{{ r.shot }}" target="_blank">zobraziť</a>{% endif %}</td></tr>
       {% else %}<tr><td colspan="6" class="mut">Zatiaľ nič.</td></tr>{% endfor %}</table></div></div>{% endblock %}
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/settings.html" <<'__IG_EOF__'
+  f_manager_templates_settings_html:
+    content: |
       {% extends "base.html" %}{% set nav='set' %}{% block body %}
       <div class="card"><h2>Cieľové príspevky</h2>
       <p>Zoznam povolených autorov už neexistuje. Cieľové príspevky určuješ <b>príkazom pre šéf-agenta</b> (Prehľad) alebo ručnou úlohou: účet vykoná akciu len na konkrétnych odkazoch, ktoré zadáš. Komentáre vždy čakajú na tvoje schválenie.</p></div>
@@ -2050,9 +2136,8 @@ configs:
       <form method="post" action="/settings/black/add" class="grid" style="margin-top:10px"><div><label>Typ</label><select name="kind"><option value="word">slovo v komentári</option><option value="post_url">URL príspevku</option></select></div>
       <div><label>Hodnota</label><input name="value" required></div><div style="align-self:end"><button class="p">Pridať</button></div></form></div>
       {% endblock %}
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/tasks.html" <<'__IG_EOF__'
+  f_manager_templates_tasks_html:
+    content: |
       {% extends "base.html" %}{% set nav='tasks' %}{% set refresh=30 %}{% block body %}
       <div class="card"><details><summary><b>+ Nová úloha ručne</b></summary>
       <form method="post" action="/tasks/new"><div class="grid">
@@ -2071,9 +2156,8 @@ configs:
       <td style="white-space:nowrap">{% if r.status=='awaiting_approval' %}<form class="inline" method="post" action="/tasks/{{ r.id }}/approve"><input type="hidden" name="next" value="/tasks"><button class="p">Schváliť</button></form>{% endif %}
       {% if r.status in ('awaiting_approval','pending') %}<form class="inline" method="post" action="/tasks/{{ r.id }}/cancel"><input type="hidden" name="next" value="/tasks"><button class="d">Zrušiť</button></form>{% endif %}</td></tr>
       {% else %}<tr><td colspan="8" class="mut">Žiadne úlohy.</td></tr>{% endfor %}</table></div></div>{% endblock %}
-      __IG_EOF__
-      mkdir -p "$$D/manager/templates"
-      cat > "$$D/manager/templates/vpn.html" <<'__IG_EOF__'
+  f_manager_templates_vpn_html:
+    content: |
       {% extends "base.html" %}{% set nav='vpn' %}{% block body %}
       <div class="card"><h2>NordVPN</h2>
       <p><small>Každý účet má vlastný VPN kontajner (gluetun, WireGuard/NordLynx) a worker ide výhradne cez neho. Ak VPN spadne, worker nemá spojenie, nikdy nejde z IP servera. Pre všetky účty sa používa jeden NordLynx kľúč tvojho NordVPN účtu.</small></p>
@@ -2093,9 +2177,8 @@ configs:
       {% else %}<tr><td colspan="5" class="mut">Žiadny účet nepoužíva NordVPN.</td></tr>{% endfor %}</table>
       <p><small>Obmedzenia: NordVPN povoľuje obmedzený počet súčasných pripojení na účet (každý beziaci účet = jedno pripojenie; over aktuálny limit u NordVPN). Výstupné IP NordVPN sú zdieľané s ďalšími zákazníkmi a pochádzajú z dátových centier; Instagram ich môže posudzovať prísnejšie. Server musí mať zariadenie /dev/net/tun (bežné KVM VPS áno; niektoré kontajnerové VPS nie).</small></p></div>
       {% endblock %}
-      __IG_EOF__
-      mkdir -p "$$D/worker"
-      cat > "$$D/worker/Dockerfile" <<'__IG_EOF__'
+  f_worker_Dockerfile:
+    content: |
       FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
       RUN apt-get update && apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify openbox \
           && rm -rf /var/lib/apt/lists/*
@@ -2107,9 +2190,8 @@ configs:
       HEALTHCHECK --interval=60s --timeout=5s --start-period=60s --retries=3 \
         CMD python -c "import time,sys;sys.exit(0 if time.time()-float(open('/tmp/heartbeat').read())<180 else 1)"
       CMD ["python", "worker.py"]
-      __IG_EOF__
-      mkdir -p "$$D/worker"
-      cat > "$$D/worker/worker.py" <<'__IG_EOF__'
+  f_worker_worker_py:
+    content: |
       """Worker pre jeden značkový IG účet. Playwright, persistentný profil, stabilná IP (proxy per účet)."""
       import os, random, sys, time, datetime
       from urllib.parse import urlparse
@@ -2387,9 +2469,8 @@ configs:
 
       if __name__ == "__main__":
           main()
-      __IG_EOF__
-      mkdir -p "$$D/worker"
-      cat > "$$D/worker/login.sh" <<'__IG_EOF__'
+  f_worker_login_sh:
+    content: |
       #!/bin/bash
       # Ručné prihlásenie účtu v kontajneri s virtuálnym displejom, dostupné cez noVNC na porte 6080.
       # Spúšťa ho webové rozhranie (tlačidlo „Prihlásiť“). noVNC je dostupné len cez autentifikovaný Caddy (/novnc/).
@@ -2403,14 +2484,8 @@ configs:
       PY=$$!
       trap 'kill -TERM $$PY 2>/dev/null' TERM INT   # docker stop -> korektné zatvorenie prehliadača
       wait $$PY; wait $$PY 2>/dev/null
-      __IG_EOF__
-      mkdir -p "$$D/worker"
-      cat > "$$D/worker/requirements.txt" <<'__IG_EOF__'
+  f_worker_requirements_txt:
+    content: |
       playwright==1.48.0
       psycopg2-binary==2.9.9
       requests==2.32.3
-      __IG_EOF__
-      chmod +x "$$D/worker/login.sh"
-      echo "== zostavujem ig-manager:1.2.0"; docker build -t ig-manager:1.2.0 "$$D/manager"
-      echo "== zostavujem ig-worker:1.2.0 (veľký obraz, chvíľu to potrvá)"; docker build -t ig-worker:1.2.0 "$$D/worker"
-      echo; echo "HOTOVO. Obrazy:"; docker images | grep -E "^ig-(manager|worker) " || true
