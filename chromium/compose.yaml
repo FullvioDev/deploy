@@ -2253,6 +2253,8 @@ configs:
   f_worker_Dockerfile:
     content: |
       FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+      # bez tohto sa tzdata pýta na časové pásmo a build navždy visí
+      ARG DEBIAN_FRONTEND=noninteractive
       RUN apt-get update && apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify openbox \
           && rm -rf /var/lib/apt/lists/*
       WORKDIR /app
