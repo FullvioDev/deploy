@@ -1,16 +1,10 @@
 # =====================================================================================
-# IG Brand Agents v1.2.0 – jednosúborový stack (vygenerované: python3 tools/build_stack.py)
-# VARIANTA PRE DOCKHAND / PORTAINER: žiadny `build` ani vlastný obraz v stacku. Manažér beží na verejnom obraze python:3.12-slim
-# (kód je v configs), obraz workera si zostaví sám pri prvom štarte (5 - 15 min; priebeh vidno v rozhraní).
-# Nasadenie:  docker compose -f docker-compose.dockhand.yml --env-file .env up -d
-# Vyžaduje Docker Compose >= 2.24 (configs.content). Návod: DOCKHAND.md
-# Premenné prostredia (všetky v súbore .env, vzor .env.stack.example):
-#   povinné: DOMAIN, ADMIN_PASSWORD, POSTGRES_PASSWORD, WORKER_DB_PASSWORD, N8N_ENCRYPTION_KEY,
-#            COMMAND_KEY, APPROVAL_KEY, NOTIFY_URL, DATA_DIR (absolútna cesta na hostiteľovi)
-#   porty: PUBLIC_PORT (kde je webové rozhranie, predvolene 443; napr. 2376 => https://DOMAIN:2376), HTTP_PORT (80, pre certifikát),
-#          DB_PORT, N8N_PORT (obe len 127.0.0.1); TLS_MODE=auto|internal (internal = vlastný certifikát, nepotrebuje 80/443 z internetu)
-#   voliteľné: NORDVPN_PRIVATE_KEY (alebo v GUI), VPN_COUNTRIES, VPN_CITIES, VPN_TAG, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY, LOCAL_LLM_MODEL + COMPOSE_PROFILES=llm,
-#              BLACKLIST_WORDS, IG_LOCALE, TZ, SEL_*, POST_LABEL
+# IG Brand Agents v1.2.0 – VARIANTA ZA EXISTUJÚCIM REVERSE PROXY (Traefik / Cloudflare tunel / nginx), bez Caddy.
+# Rozhranie, noVNC aj webhooky idú cez JEDEN port manažéra: PUBLIC_PORT (predvolene 2376) na PUBLIC_BIND (predvolene 127.0.0.1).
+# Prihlasovanie (admin + ADMIN_PASSWORD) rieši aplikácia; TLS rieši tvoj proxy. Návod: PROXY.md
+# povinné: PUBLIC_URL, ADMIN_PASSWORD, POSTGRES_PASSWORD, WORKER_DB_PASSWORD, N8N_ENCRYPTION_KEY, COMMAND_KEY, APPROVAL_KEY, NOTIFY_URL, DATA_DIR
+# Traefik (voliteľné): TRAEFIK_HOST, TRAEFIK_ENTRYPOINT, TRAEFIK_NETWORK, TRAEFIK_TLS, TRAEFIK_CERTRESOLVER, TRAEFIK_ENABLE
+# Vyžaduje Docker Compose >= 2.24 (configs.content).
 # =====================================================================================
 name: ig-brand-agents
 
@@ -21,8 +15,6 @@ networks:
 volumes:
   pgdata:
   n8ndata:
-  caddydata:
-  caddyconfig:
   ollamadata:
   managerdeps:
 
@@ -31,6 +23,8 @@ services:
   # ---- databáza (schéma a rola pre workery sa vytvoria pri prvom štarte z configs) ----
   postgres:
     image: postgres:16
+    labels:
+      - traefik.enable=false
     restart: unless-stopped
     environment:
       POSTGRES_USER: igagents
@@ -55,6 +49,8 @@ services:
   # ---- jednorazový import credentialu a workflow do n8n (pri každom štarte; idempotentné) ----
   n8n-init:
     image: n8nio/n8n:1.100.1
+    labels:
+      - traefik.enable=false
     restart: "no"
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -91,17 +87,17 @@ services:
 
   n8n:
     image: n8nio/n8n:1.100.1
+    labels:
+      - traefik.enable=false
     restart: unless-stopped
-    ports: ["127.0.0.1:${N8N_PORT:-5678}:5678"]        # editor len cez SSH tunel; webhooky idú cez Caddy
+    ports: ["127.0.0.1:${N8N_PORT:-5678}:5678"]        # editor len cez SSH tunel; webhooky idú cez manažér
     environment:
       GENERIC_TIMEZONE: ${TZ:-Europe/Bratislava}
       TZ: ${TZ:-Europe/Bratislava}
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?nastav N8N_ENCRYPTION_KEY}
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
-      N8N_HOST: ${DOMAIN:?nastav DOMAIN}
-      N8N_PROTOCOL: https
-      WEBHOOK_URL: https://${DOMAIN:?nastav DOMAIN}:${PUBLIC_PORT:-443}/
-      N8N_PUBLIC_URL: https://${DOMAIN:?nastav DOMAIN}:${PUBLIC_PORT:-443}/
+      WEBHOOK_URL: ${PUBLIC_URL:?nastav PUBLIC_URL (napr. https://chromium.fullvio.dev/)}
+      N8N_PUBLIC_URL: ${PUBLIC_URL:?nastav PUBLIC_URL}
       NOTIFY_URL: ${NOTIFY_URL:?nastav NOTIFY_URL}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       COMMAND_KEY: ${COMMAND_KEY:?nastav COMMAND_KEY}
@@ -121,7 +117,18 @@ services:
         pip install --no-cache-dir --target /deps -r /app/requirements.txt
         exec python -m uvicorn app:app --host 0.0.0.0 --port 8000
     restart: unless-stopped
+    ports: ["${PUBLIC_BIND:-127.0.0.1}:${PUBLIC_PORT:-2376}:8000"]      # jediný vstup: rozhranie, noVNC aj webhooky
+    labels:                                                              # voliteľné, pre Traefik (TRAEFIK_ENABLE=false ich vypne)
+      - traefik.enable=${TRAEFIK_ENABLE:-true}
+      - traefik.docker.network=${TRAEFIK_NETWORK:-ig_net}
+      - traefik.http.routers.ig.rule=Host(`${TRAEFIK_HOST:-ig.local}`)
+      - traefik.http.routers.ig.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.ig.tls=${TRAEFIK_TLS:-true}
+      - traefik.http.routers.ig.tls.certresolver=${TRAEFIK_CERTRESOLVER:-}
+      - traefik.http.services.ig.loadbalancer.server.port=8000
     environment:
+      APP_AUTH: "on"
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?nastav ADMIN_PASSWORD}
       PYTHONPATH: /deps
       WORKER_SRC: /worker-src
       BUILDER_IMAGE: docker:cli
@@ -188,51 +195,11 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
 
-  # ---- HTTPS + heslo (Caddyfile sa vygeneruje pri štarte z DOMAIN a ADMIN_PASSWORD) ----
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    ports: ["${HTTP_PORT:-80}:80", "${PUBLIC_PORT:-443}:${PUBLIC_PORT:-443}", "${PUBLIC_PORT:-443}:${PUBLIC_PORT:-443}/udp"]
-    environment:
-      DOMAIN: ${DOMAIN:?nastav DOMAIN}
-      PUBLIC_PORT: ${PUBLIC_PORT:-443}
-      TLS_MODE: ${TLS_MODE:-auto}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?nastav ADMIN_PASSWORD}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        HASH="$$(caddy hash-password --plaintext "$$ADMIN_PASSWORD")"
-        TLS_LINE=""
-        [ "$$TLS_MODE" = "internal" ] && TLS_LINE="tls internal"
-        cat > /etc/caddy/Caddyfile <<EOF
-        https://$$DOMAIN:$$PUBLIC_PORT {
-            $$TLS_LINE
-            @hooks path /webhook/* /webhook-test/*
-            handle @hooks {
-                reverse_proxy n8n:5678
-            }
-            handle {
-                basic_auth {
-                    admin $$HASH
-                }
-                handle_path /novnc/* {
-                    reverse_proxy ig-login:6080
-                }
-                handle {
-                    reverse_proxy manager:8000
-                }
-            }
-        }
-        EOF
-        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
-    volumes:
-      - caddydata:/data
-      - caddyconfig:/config
-    depends_on: [manager, n8n]
-
   # ---- denná záloha DB (14 dní) a čistenie starých screenshotov (30 dní); ukladá do DATA_DIR/_backups ----
   backup:
     image: postgres:16
+    labels:
+      - traefik.enable=false
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -1045,11 +1012,11 @@ configs:
   f_manager_app_py:
     content: |
       """Webové rozhranie (manager): správa účtov, workerov, úloh a schvaľovania."""
-      import hashlib, io, json, os, re, requests, tarfile, threading, time
+      import asyncio, base64, hashlib, io, json, os, re, requests, secrets, tarfile, threading, time
       from contextlib import asynccontextmanager
       import psycopg2, psycopg2.extras
-      from fastapi import FastAPI, Form, HTTPException, Request
-      from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
+      from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
+      from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, Response
       from fastapi.templating import Jinja2Templates
 
       import llm
@@ -1070,6 +1037,9 @@ configs:
       N8N_URL = os.environ.get("N8N_URL", "http://n8n:5678")
       COMMAND_KEY = os.environ.get("COMMAND_KEY", "")
       LOGIN_NAME = "ig-login"
+      APP_AUTH = os.environ.get("APP_AUTH", "off").lower() == "on"     # prihlasovanie (HTTP Basic) priamo v aplikácii; používa sa za Traefikom
+      ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+      LOGIN_UPSTREAM = os.environ.get("LOGIN_UPSTREAM", "ig-login:6080")
       VPN_IMAGE = os.environ.get("VPN_IMAGE", "qmcgaw/gluetun:v3")
       WORKER_SRC = os.environ.get("WORKER_SRC", "")          # priečinok so zdrojmi workera (Dockerfile, worker.py, login.sh, requirements.txt)
       BUILDER_IMAGE = os.environ.get("BUILDER_IMAGE", "docker:cli")
@@ -1121,13 +1091,37 @@ configs:
               conn.close()
 
 
+      def _key_protected(path):
+          """Cesty chránené vlastnými kľúčmi (nie heslom/CSRF): API pre n8n a webhooky n8n."""
+          return path.startswith(("/api/", "/webhook/", "/webhook-test/"))
+
+
       @app.middleware("http")
       async def csrf_guard(request: Request, call_next):
-          if request.method == "POST" and not request.url.path.startswith("/api/"):
+          if request.method == "POST" and not _key_protected(request.url.path):
               src = request.headers.get("origin") or request.headers.get("referer") or ""
               host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
               if not host or host not in src:
                   return PlainTextResponse("CSRF kontrola zlyhala", status_code=403)
+          return await call_next(request)
+
+
+      def _auth_ok(header):
+          """HTTP Basic: používateľ admin + ADMIN_PASSWORD. Bez nastaveného hesla je všetko zamknuté."""
+          if not ADMIN_PASSWORD: return False
+          try:
+              scheme, _, b64 = (header or "").partition(" ")
+              if scheme.lower() != "basic": return False
+              user, _, pw = base64.b64decode(b64).decode().partition(":")
+          except Exception:
+              return False
+          return secrets.compare_digest(user.encode(), b"admin") & secrets.compare_digest(pw.encode(), ADMIN_PASSWORD.encode())
+
+
+      @app.middleware("http")
+      async def basic_auth_guard(request: Request, call_next):
+          if APP_AUTH and not _key_protected(request.url.path) and not _auth_ok(request.headers.get("authorization")):
+              return Response("Vyžaduje sa prihlásenie", status_code=401, headers={"WWW-Authenticate": 'Basic realm="IG Brand Agents"'})
           return await call_next(request)
 
 
@@ -1316,7 +1310,7 @@ configs:
           if c is None:
               c = dc.containers.run(VPN_IMAGE, name=name, detach=True, cap_add=["NET_ADMIN"],
                                     devices=["/dev/net/tun:/dev/net/tun"], environment=env, network=NET,
-                                    restart_policy={"Name": "unless-stopped"}, labels={"ig.vpn": name, "ig.vpncfg": cfg})
+                                    restart_policy={"Name": "unless-stopped"}, labels={"ig.vpn": name, "ig.vpncfg": cfg, "traefik.enable": "false"})
           t0 = time.time()
           while True:
               c.reload()
@@ -1358,7 +1352,7 @@ configs:
           dc.containers.run(IMAGE, name=wname(u), hostname=wname(u), detach=True, environment=account_env(acc, proxy),
                             network=NET, shm_size="1g", restart_policy={"Name": "unless-stopped"},
                             volumes={f"{HOST_DATA}/{u}": {"bind": "/data", "mode": "rw"}},
-                            labels={"ig.managed": "1", "ig.account": u})
+                            labels={"ig.managed": "1", "ig.account": u, "traefik.enable": "false"})
           return dup_ip_warning(acc, ip)
 
 
@@ -1538,8 +1532,73 @@ configs:
           os.makedirs(f"{DATA_ROOT}/{u}", exist_ok=True)
           dc.containers.run(IMAGE, name=LOGIN_NAME, command=["./login.sh"], detach=True, environment=account_env(acc, proxy),
                             network=NET, shm_size="1g", volumes={f"{HOST_DATA}/{u}": {"bind": "/data", "mode": "rw"}},
-                            labels={"ig.login": u})
+                            labels={"ig.login": u, "traefik.enable": "false"})
           return back(f"/login/{aid}")
+
+
+      # --- webhooky n8n cez aplikáciu (jeden verejný port: rozhranie + noVNC + webhooky). Chránené kľúčmi vo workflow.
+      @app.api_route("/webhook/{path:path}", methods=["GET", "POST"])
+      @app.api_route("/webhook-test/{path:path}", methods=["GET", "POST"])
+      async def n8n_webhook_proxy(path: str, request: Request):
+          from starlette.concurrency import run_in_threadpool
+          base = "webhook-test" if request.url.path.startswith("/webhook-test/") else "webhook"
+          body = await request.body()
+          headers = {k: v for k, v in request.headers.items() if k.lower() in ("content-type", "x-api-key", "accept")}
+          try:
+              r = await run_in_threadpool(lambda: requests.request(request.method, f"{N8N_URL}/{base}/{path}", params=dict(request.query_params),
+                                                                   data=body, headers=headers, timeout=900))
+          except requests.RequestException as e:
+              return PlainTextResponse(f"n8n nie je dostupné: {e}", status_code=502)
+          return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
+
+
+      # --- noVNC (okno na prihlásenie účtu) cez aplikáciu: staticky + WebSocket na kontajner ig-login
+      @app.get("/novnc/{path:path}")
+      def novnc_http(path: str, request: Request):
+          try:
+              r = requests.get(f"http://{LOGIN_UPSTREAM}/{path}", params=dict(request.query_params), timeout=10)
+          except requests.RequestException:
+              return PlainTextResponse("Prihlasovacie okno nebeží. Spusti ho tlačidlom Prihlásiť.", status_code=502)
+          return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
+
+
+      @app.websocket("/novnc/websockify")
+      async def novnc_ws(ws: WebSocket):
+          if APP_AUTH and not _auth_ok(ws.headers.get("authorization")):
+              await ws.close(code=1008); return
+          import websockets
+          subs = ws.scope.get("subprotocols", [])
+          try:
+              up = await websockets.connect(f"ws://{LOGIN_UPSTREAM}/websockify", subprotocols=subs or None, max_size=None)
+          except Exception:
+              await ws.close(code=1011); return
+          await ws.accept(subprotocol=(up.subprotocol or (subs[0] if subs else None)))
+
+          async def c2u():
+              try:
+                  while True:
+                      m = await ws.receive()
+                      if m["type"] == "websocket.disconnect": break
+                      if m.get("bytes") is not None: await up.send(m["bytes"])
+                      elif m.get("text") is not None: await up.send(m["text"])
+              except Exception:
+                  pass
+
+          async def u2c():
+              try:
+                  async for msg in up:
+                      if isinstance(msg, bytes): await ws.send_bytes(msg)
+                      else: await ws.send_text(msg)
+              except Exception:
+                  pass
+
+          tasks = [asyncio.create_task(c2u()), asyncio.create_task(u2c())]
+          await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+          for t in tasks: t.cancel()
+          try: await up.close()
+          except Exception: pass
+          try: await ws.close()
+          except Exception: pass
 
 
       @app.get("/login/{aid}", response_class=HTMLResponse)
@@ -1957,6 +2016,7 @@ configs:
       psycopg2-binary==2.9.9
       docker==7.1.0
       requests==2.32.3
+      websockets==12.0
   f_manager_templates_account_html:
     content: |
       {% extends "base.html" %}{% block body %}
