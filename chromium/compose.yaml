@@ -1,7 +1,9 @@
 # =====================================================================================
 # IG Brand Agents v1.2.0 – VARIANTA ZA EXISTUJÚCIM REVERSE PROXY (Traefik / Cloudflare tunel / nginx), bez Caddy.
-# Rozhranie, noVNC aj webhooky idú cez JEDEN port manažéra: PUBLIC_PORT (predvolene 2376) na PUBLIC_BIND (predvolene 127.0.0.1).
-# Prihlasovanie (admin + ADMIN_PASSWORD) rieši aplikácia; TLS rieši tvoj proxy. Návod: PROXY.md
+# Rozhranie, noVNC aj webhooky idú cez JEDEN HTTPS port manažéra: PUBLIC_PORT (predvolene 2376) na PUBLIC_BIND (predvolene 127.0.0.1).
+# Prihlasovanie (admin + ADMIN_PASSWORD) rieši aplikácia. Manažér hovorí HTTPS so self-signed certifikátom (vytvorí sa pri prvom
+# štarte vo volume managertls); verejný certifikát dáva tvoj proxy, ktorý ide na backend cez https:// bez overenia (Traefik:
+# insecureSkipVerify). Vlastný certifikát: nahraď /tls/cert.pem a /tls/key.pem vo volume a reštartuj manager. Návod: PROXY.md
 # povinné: PUBLIC_URL, ADMIN_PASSWORD, POSTGRES_PASSWORD, WORKER_DB_PASSWORD, N8N_ENCRYPTION_KEY, COMMAND_KEY, APPROVAL_KEY, NOTIFY_URL, DATA_DIR
 # Traefik (voliteľné): TRAEFIK_HOST, TRAEFIK_ENTRYPOINT, TRAEFIK_NETWORK, TRAEFIK_TLS, TRAEFIK_CERTRESOLVER, TRAEFIK_ENABLE
 # Vyžaduje Docker Compose >= 2.24 (configs.content).
@@ -17,6 +19,7 @@ volumes:
   n8ndata:
   ollamadata:
   managerdeps:
+  managertls:
 
 services:
 
@@ -115,9 +118,10 @@ services:
     command:
       - |
         pip install --no-cache-dir --target /deps -r /app/requirements.txt
-        exec python -m uvicorn app:app --host 0.0.0.0 --port 8000
+        [ -s /tls/cert.pem ] && [ -s /tls/key.pem ] || openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=manager" -addext "subjectAltName=DNS:manager,DNS:localhost" -keyout /tls/key.pem -out /tls/cert.pem
+        exec python -m uvicorn app:app --host 0.0.0.0 --port 8000 --ssl-keyfile /tls/key.pem --ssl-certfile /tls/cert.pem
     restart: unless-stopped
-    ports: ["${PUBLIC_BIND:-127.0.0.1}:${PUBLIC_PORT:-2376}:8000"]      # jediný vstup: rozhranie, noVNC aj webhooky
+    ports: ["${PUBLIC_BIND:-127.0.0.1}:${PUBLIC_PORT:-2376}:8000"]      # jediný vstup (HTTPS): rozhranie, noVNC aj webhooky
     labels:                                                              # voliteľné, pre Traefik (TRAEFIK_ENABLE=false ich vypne)
       - traefik.enable=${TRAEFIK_ENABLE:-true}
       - traefik.docker.network=${TRAEFIK_NETWORK:-ig_net}
@@ -126,6 +130,7 @@ services:
       - traefik.http.routers.ig.tls=${TRAEFIK_TLS:-true}
       - traefik.http.routers.ig.tls.certresolver=${TRAEFIK_CERTRESOLVER:-}
       - traefik.http.services.ig.loadbalancer.server.port=8000
+      - traefik.http.services.ig.loadbalancer.server.scheme=https
     environment:
       APP_AUTH: "on"
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?nastav ADMIN_PASSWORD}
@@ -155,6 +160,7 @@ services:
     extra_hosts: ["host.docker.internal:host-gateway"]
     volumes:
       - managerdeps:/deps
+      - managertls:/tls
       - /var/run/docker.sock:/var/run/docker.sock
       - ${DATA_DIR:?nastav DATA_DIR}:/data-root
     configs:
@@ -436,7 +442,7 @@ configs:
           {
             "parameters": {
               "method": "POST",
-              "url": "http://manager:8000/api/agent",
+              "url": "https://manager:8000/api/agent",
               "sendHeaders": true,
               "headerParameters": {
                 "parameters": [
@@ -455,6 +461,7 @@ configs:
               "jsonBody": "={{ JSON.stringify({ command: $$('Webhook command').first().json.body.command, requested_by: $$('Webhook command').first().json.body.requested_by || 'operator' }) }}",
               "options": {
                 "timeout": 900000,
+                "allowUnauthorizedCerts": true,
                 "response": {
                   "response": {
                     "neverError": true
