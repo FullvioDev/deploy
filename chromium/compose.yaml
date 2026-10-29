@@ -1,78 +1,2438 @@
-# One remote Chromium browser whose traffic all leaves through NordVPN.
-# Watch and drive it from your own browser at https://<host-ip>:${PORT}/
-# (3101 by default).
-#
-# The browser has no network of its own: it joins the network of the `vpn`
-# container (gluetun), which holds the NordVPN WireGuard tunnel. gluetun's
-# firewall drops anything that is not going through the tunnel, so if the VPN
-# drops, the browser goes offline instead of falling back to this host's IP.
-# DNS is resolved by gluetun too. Sites see a NordVPN address, never this host.
-#
-# The viewer port is published on `vpn`, not on `chromium`, because that is the
-# network the browser listens on. Only you reach it, from this host's network:
-# replies to the viewer go back out the normal way, not through the tunnel.
-#
-# NordVPN key, needed once: in your Nord Account open NordVPN > "Set up NordVPN
-# manually", generate an access token, then on any machine run
-#
-#   curl -s -u token:<ACCESS_TOKEN> https://api.nordvpn.com/v1/users/services/credentials
-#
-# and put the "nordlynx_private_key" value from the reply in NORDVPN_PRIVATE_KEY.
-# It is not your account password.
-#
-# HTTPS, not HTTP: the image (linuxserver/chromium, Selkies-based) streams the
-# screen with WebCodecs, which browsers only allow on a secure page. The
-# certificate is self-signed, so expect a warning the first time. The image's
-# plain-HTTP port 3000 is meant for a reverse proxy only and is not published.
-#
-# Anyone who reaches the port gets a working browser with whatever is signed in
-# inside it. That is why CUSTOM_USER and PASSWORD (HTTP basic auth) are required.
-#
-# Budget about 1 GB of RAM for the browser, more for heavy pages.
-services:
-  vpn:
-    # Floating major tag: follows every 3.x release.
-    image: qmcgaw/gluetun:${VPN_TAG:-v3}
-    container_name: ${CNTNR:-chromium}-vpn
-    restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    ports:
-      - "${PORT:-3101}:3001"
-    environment:
-      TZ: ${TZ:-Etc/UTC}
-      VPN_SERVICE_PROVIDER: nordvpn
-      VPN_TYPE: wireguard
-      WIREGUARD_PRIVATE_KEY: ${NORDVPN_PRIVATE_KEY:?set NORDVPN_PRIVATE_KEY to your NordLynx private key}
-      # Comma-separated, e.g. "Germany" or "Slovakia,Czech Republic".
-      # Empty picks any NordVPN server worldwide.
-      SERVER_COUNTRIES: ${VPN_COUNTRIES:-}
-      SERVER_CITIES: ${VPN_CITIES:-}
+# =====================================================================================
+# IG Brand Agents v1.1.0 – jednosúborový stack (vygenerované: python3 tools/build_stack.py)
+# Nasadenie:  docker compose -f docker-compose.stack.yml --env-file .env up -d
+# Vyžaduje Docker Compose >= 2.24 (configs.content, dockerfile_inline). Návod: STACK.md
+# Premenné prostredia (všetky v súbore .env, vzor .env.stack.example):
+#   povinné: DOMAIN, ADMIN_PASSWORD, POSTGRES_PASSWORD, WORKER_DB_PASSWORD, N8N_ENCRYPTION_KEY,
+#            COMMAND_KEY, APPROVAL_KEY, NOTIFY_URL, DATA_DIR (absolútna cesta na hostiteľovi)
+#   voliteľné: NORDVPN_PRIVATE_KEY (alebo v GUI), VPN_COUNTRIES, VPN_CITIES, VPN_TAG, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY, LOCAL_LLM_MODEL + COMPOSE_PROFILES=llm,
+#              ALLOWED_AUTHORS, ALLOWED_URL_PREFIXES, BLACKLIST_WORDS, IG_LOCALE, TZ, SEL_*, POST_LABEL
+# =====================================================================================
+name: ig-brand-agents
 
-  chromium:
-    image: lscr.io/linuxserver/chromium:${TAG:-latest}
-    container_name: ${CNTNR:-chromium}
+networks:
+  default:
+    name: ig_net
+
+volumes:
+  pgdata:
+  n8ndata:
+  caddydata:
+  caddyconfig:
+  ollamadata:
+
+services:
+
+  # ---- databáza (schéma a rola pre workery sa vytvoria pri prvom štarte z configs) ----
+  postgres:
+    image: postgres:16
     restart: unless-stopped
-    # No `ports:` here: this container uses vpn's network, so its port 3001 is
-    # published by `vpn` above. Docker refuses ports on a network_mode service.
-    network_mode: "service:vpn"
-    depends_on:
-      vpn:
-        # Start only once the tunnel is up, and restart with `vpn`: a browser
-        # left on a replaced vpn container would have no network at all.
-        condition: service_healthy
-        restart: true
-    # A ceiling on /dev/shm, not memory set aside: only what Chromium actually
-    # writes there uses RAM. The image's docs: modern sites break without it.
-    shm_size: "1gb"
     environment:
-      PUID: ${PUID:-1000}
-      PGID: ${PGID:-1000}
-      TZ: ${TZ:-Etc/UTC}
-      CUSTOM_USER: ${CUSTOM_USER:?set CUSTOM_USER for the viewer login}
-      PASSWORD: ${PASSWORD:?set PASSWORD for the viewer login}
-      CHROME_CLI: ${URL:?set URL to the page the browser opens}
+      POSTGRES_USER: igagents
+      POSTGRES_DB: igagents
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?nastav POSTGRES_PASSWORD}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?nastav WORKER_DB_PASSWORD}
+    ports: ["${DB_BIND:-127.0.0.1}:5432:5432"]
     volumes:
-      - ${DIR:-/home/administrator/chromium}/1:/config
+      - pgdata:/var/lib/postgresql/data
+    configs:
+      - source: db_schema
+        target: /docker-entrypoint-initdb.d/01-schema.sql
+      - source: db_roles
+        target: /docker-entrypoint-initdb.d/03-roles.sh
+        mode: 0755
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U igagents -d igagents -tAc \"select 1 from pg_roles where rolname='ig_worker'\" | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  # ---- jednorazový import credentialu a workflow do n8n (pri každom štarte; idempotentné) ----
+  n8n-init:
+    image: n8nio/n8n:1.100.1
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat > /tmp/creds.json <<EOF
+        [{"id":"pgigagents","name":"Postgres igagents","type":"postgres","data":{"host":"postgres","port":5432,"database":"$$POSTGRES_DB","user":"$$POSTGRES_USER","password":"$$POSTGRES_PASSWORD","ssl":"disable","allowUnauthorizedCerts":false,"sshTunnel":false}}]
+        EOF
+        n8n import:credentials --input=/tmp/creds.json
+        rm -f /tmp/creds.json
+        n8n import:workflow --separate --input=/workflows/
+        n8n update:workflow --all --active=true || echo "VAROVANIE: workflow aktivuj ručne v n8n (prepínač Active)"
+    environment:
+      POSTGRES_USER: igagents
+      POSTGRES_DB: igagents
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?nastav POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?nastav N8N_ENCRYPTION_KEY}
+    volumes:
+      - n8ndata:/home/node/.n8n
+    configs:
+      - source: wf_01
+        target: /workflows/01-intake.json
+      - source: wf_02
+        target: /workflows/02-approval.json
+      - source: wf_03
+        target: /workflows/03-risk-alert.json
+      - source: wf_04
+        target: /workflows/04-daily-report.json
+      - source: wf_05
+        target: /workflows/05-monitor.json
+      - source: wf_06
+        target: /workflows/06-daily-reset.json
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  n8n:
+    image: n8nio/n8n:1.100.1
+    restart: unless-stopped
+    ports: ["127.0.0.1:5678:5678"]        # editor len cez SSH tunel; webhooky idú cez Caddy
+    environment:
+      GENERIC_TIMEZONE: ${TZ:-Europe/Bratislava}
+      TZ: ${TZ:-Europe/Bratislava}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?nastav N8N_ENCRYPTION_KEY}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_HOST: ${DOMAIN:?nastav DOMAIN}
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://${DOMAIN:?nastav DOMAIN}/
+      N8N_PUBLIC_URL: https://${DOMAIN:?nastav DOMAIN}/
+      NOTIFY_URL: ${NOTIFY_URL:?nastav NOTIFY_URL}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      COMMAND_KEY: ${COMMAND_KEY:?nastav COMMAND_KEY}
+      APPROVAL_KEY: ${APPROVAL_KEY:?nastav APPROVAL_KEY}
+    volumes:
+      - n8ndata:/home/node/.n8n
+    depends_on:
+      n8n-init: {condition: service_completed_successfully}
+
+  # ---- obraz workera (zostaví sa z vloženého Dockerfile; manager z neho spúšťa kontajnery pre účty) ----
+  worker-build:
+    image: ig-worker:1.1.0
+    restart: "no"
+    command: ["true"]
+    build:
+      context: .
+      dockerfile_inline: |
+        # syntax=docker/dockerfile:1
+        FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+        RUN apt-get update && apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify openbox \
+            && rm -rf /var/lib/apt/lists/*
+        WORKDIR /app
+        COPY <<"__IG_EOF__" /app/requirements.txt
+        playwright==1.48.0
+        psycopg2-binary==2.9.9
+        requests==2.32.3
+        __IG_EOF__
+        RUN pip install --no-cache-dir -r requirements.txt
+        COPY <<"__IG_EOF__" /app/worker.py
+        """Worker pre jeden značkový IG účet. Playwright, persistentný profil, stabilná IP (proxy per účet)."""
+        import os, random, sys, time, datetime
+        from urllib.parse import urlparse
+
+        import psycopg2, psycopg2.extras, requests
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+        ACCOUNT = os.environ["ACCOUNT_USERNAME"]
+        DSN = os.environ["DATABASE_URL"]
+        PROFILE_DIR = os.environ.get("PROFILE_DIR", "/data/profile")
+        SHOT_DIR = os.environ.get("SCREENSHOT_DIR", "/data/screenshots")
+        ALERT_WEBHOOK = os.environ.get("N8N_ALERT_WEBHOOK", "")
+        HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
+        HEARTBEAT_FILE = "/tmp/heartbeat"
+        IDLE_SLEEP = int(os.environ.get("IDLE_SLEEP", 30))
+        LEASE_MIN = int(os.environ.get("LEASE_MINUTES", 10))
+
+        # Selektory závisia od jazyka UI – uprav podľa locale účtu.
+        SEL = {
+            "like":      os.environ.get("SEL_LIKE", 'svg[aria-label="Like"]'),
+            "unlike":    os.environ.get("SEL_UNLIKE", 'svg[aria-label="Unlike"]'),
+            "comment":   os.environ.get("SEL_COMMENT", 'textarea[aria-label="Add a comment…"]'),
+        }
+        POST_LABEL = os.environ.get("POST_LABEL", "Post")
+        RISK_URL_PARTS = ("/challenge", "/accounts/login", "/suspended", "/accounts/suspended")
+        RISK_TEXTS = ("unusual activity", "suspicious", "try again later", "confirm it's you",
+                      "action blocked", "we restrict certain activity")
+
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        for _f in ("SingletonLock", "SingletonCookie", "SingletonSocket"):   # zostatky po reštarte kontajnera
+            try:
+                os.remove(os.path.join(PROFILE_DIR, _f))
+            except FileNotFoundError:
+                pass
+        db = psycopg2.connect(DSN)
+        db.autocommit = True
+
+
+        def q(sql, args=None, one=False):
+            with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, args)
+                if cur.description:
+                    return cur.fetchone() if one else cur.fetchall()
+
+
+        def log(task_id, account_id, event, error=None, shot=None):
+            q("INSERT INTO logs(task_id,account_id,event,error,screenshot_url) VALUES(%s,%s,%s,%s,%s)",
+              (task_id, account_id, event, error, shot))
+
+
+        def alert(kind, msg):
+            print(f"[ALERT:{kind}] {msg}", flush=True)
+            if ALERT_WEBHOOK:
+                try:
+                    requests.post(ALERT_WEBHOOK, json={"account": ACCOUNT, "kind": kind, "message": msg}, timeout=10)
+                except requests.RequestException:
+                    pass
+
+
+        class RiskDetected(Exception):
+            pass
+
+
+        class NotAllowed(Exception):
+            pass
+
+
+        def reap(acc_id):
+            """Zaseknuté úlohy (lease vypršal) vráť do fronty alebo označ ako failed."""
+            q("""UPDATE tasks SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
+                        result = 'lease expired'
+                 WHERE account_id=%s AND status='in_progress' AND lease_expires_at < now()""", (acc_id,))
+
+
+        def allowed_actions(acc):
+            done_hour = q("""SELECT count(*) c FROM tasks WHERE account_id=%s AND status='done'
+                             AND finished_at > now() - interval '1 hour'""", (acc["id"],), one=True)["c"]
+            if done_hour >= acc["hourly_action_limit"]:
+                return []
+            out = []
+            if acc["likes_today"] < acc["daily_like_limit"]:
+                out.append("like")
+            if acc["comments_today"] < acc["daily_comment_limit"]:
+                out.append("comment")
+            return out
+
+
+        def claim(acc_id, actions):
+            return q("""WITH t AS (
+                          SELECT id FROM tasks
+                          WHERE account_id=%s AND status='pending' AND action = ANY(%s)
+                            AND (not_before IS NULL OR not_before <= now())
+                            AND (action='like' OR approved_at IS NOT NULL)   -- komentár len po schválení
+                          ORDER BY priority DESC, created_at
+                          FOR UPDATE SKIP LOCKED LIMIT 1)
+                        UPDATE tasks SET status='in_progress', started_at=now(), attempts=attempts+1,
+                               lease_expires_at = now() + (%s || ' minutes')::interval
+                        FROM t WHERE tasks.id = t.id RETURNING tasks.*""",
+                     (acc_id, actions, str(LEASE_MIN)), one=True)
+
+
+        def target_ok(task):
+            """Obrana do hĺbky: allowlist + blacklist sa kontroluje aj vo workeri."""
+            url = task["post_url"].strip()
+            host = urlparse(url).netloc.lower()
+            if host not in ("www.instagram.com", "instagram.com"):
+                return False, "post_url nie je instagram.com"
+            for b in q("SELECT kind,value FROM blacklist"):
+                if b["kind"] == "post_url" and b["value"] == url:
+                    return False, "post_url na blackliste"
+                if b["kind"] == "word" and task.get("comment_text") and b["value"].lower() in task["comment_text"].lower():
+                    return False, f"blacklist slovo: {b['value']}"
+            return True, ""
+
+
+        def detect_author(page):
+            """Autor príspevku z hlavičky stránky (/username/). None, ak sa nedá zistiť."""
+            try:
+                href = page.evaluate("""() => { const a = document.querySelector('header a[role="link"][href^="/"]') ||
+                                               document.querySelector('article header a[href^="/"]');
+                                          return a ? a.getAttribute('href') : null; }""")
+            except Exception:
+                return None
+            parts = [x for x in (href or "").split("/") if x]
+            return parts[0].lower() if parts else None
+
+
+        def allowlist_ok(page, task):
+            """Allowlist: zhoda s url_prefix ALEBO autor príspevku (zistený zo stránky) je v zozname. Inak zamietnuť."""
+            url = task["post_url"].strip()
+            allow = q("SELECT kind,value FROM allowed_targets")
+            if any(a["kind"] == "url_prefix" and url.startswith(a["value"]) for a in allow):
+                return True, ""
+            author = detect_author(page)
+            authors = {a["value"].lstrip("@").lower() for a in allow if a["kind"] == "author"}
+            if author and author in authors:
+                return True, ""
+            return False, f"autor '{author}' nie je v allowliste"
+
+
+        def check_risk(page):
+            if any(p in page.url for p in RISK_URL_PARTS):
+                raise RiskDetected(f"redirect na {page.url}")
+            # odhlásená session / login stena
+            if page.query_selector('input[name="username"]') and page.query_selector('input[name="password"]'):
+                raise RiskDetected("odhlásená session (zobrazený login formulár)")
+            # texty hľadáme len v dialógoch a alertoch, nie v komentároch používateľov
+            try:
+                texts = page.eval_on_selector_all('[role="dialog"], [role="alert"]', "els => els.map(e => e.innerText)")
+            except Exception:
+                texts = []
+            blob = " ".join(texts).lower()
+            for t in RISK_TEXTS:
+                if t in blob:
+                    raise RiskDetected(f"dialóg na stránke: {t}")
+
+
+        def pause(acc):
+            time.sleep(random.uniform(float(acc["pause_min_s"]), float(acc["pause_max_s"])))
+
+
+        def heartbeat(acc_id):
+            q("UPDATE accounts SET last_seen=now() WHERE id=%s", (acc_id,))
+            open(HEARTBEAT_FILE, "w").write(str(time.time()))
+
+
+        def in_window(acc):
+            r = q("""SELECT (now() AT TIME ZONE tz)::time BETWEEN active_from AND active_to AS ok
+                     FROM accounts WHERE id=%s""", (acc["id"],), one=True)
+            return r["ok"]
+
+
+        class AmbiguousSubmit(Exception):
+            """Komentár mohol byť odoslaný, ale overenie zlyhalo. NIKDY sa neopakuje automaticky (hrozí duplicita)."""
+
+
+        def do_task(page, task, acc):
+            dry = acc["dry_run"]
+            page.goto(task["post_url"], wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2500)
+            check_risk(page)
+            ok, why = allowlist_ok(page, task)
+            if not ok:
+                raise NotAllowed(why)
+            if task["action"] == "like":
+                if page.locator(SEL["unlike"]).count():
+                    return "already_liked"
+                icon = page.locator(SEL["like"]).first
+                if not icon.count():
+                    raise RuntimeError("like button not found")
+                if dry:
+                    return "dry_run: like button found"
+                icon.locator('xpath=ancestor::*[self::button or @role="button"][1]').click(timeout=8000)
+                page.wait_for_selector(SEL["unlike"], timeout=8000)
+                return "liked"
+
+            box = page.locator(SEL["comment"]).first
+            box.wait_for(timeout=10000)
+            box.click()
+            box.fill(task["comment_text"])
+            if dry:
+                shot(page, task["id"], "dryrun_comment")
+                box.fill("")
+                return "dry_run: comment box found, text not submitted"
+            pause(acc)
+            try:   # od tohto momentu už komentár mohol odísť – žiadne automatické opakovanie
+                btn = page.locator("form:has(" + SEL["comment"] + ")").get_by_role("button", name=POST_LABEL, exact=True)
+                if btn.count():
+                    btn.first.click(timeout=5000)
+                else:
+                    box.press("Enter")
+                page.wait_for_timeout(3500)
+                check_risk(page)
+                page.get_by_text(task["comment_text"][:60], exact=False).first.wait_for(timeout=8000)
+            except RiskDetected:
+                raise
+            except Exception as e:
+                raise AmbiguousSubmit(f"nepodarilo sa overiť odoslanie komentára: {e}")
+            return "commented"
+
+
+        def shot(page, task_id, tag):
+            path = f"{SHOT_DIR}/{ACCOUNT}_{task_id}_{tag}_{datetime.datetime.utcnow():%Y%m%dT%H%M%S}.png"
+            try:
+                page.screenshot(path=path)
+                return path
+            except Exception:
+                return None
+
+
+        def set_risk(acc_id, task, reason, page):
+            path = shot(page, task["id"], "risk")
+            q("UPDATE accounts SET status='risk', risk_reason=%s WHERE id=%s", (reason, acc_id))
+            q("UPDATE tasks SET status='pending', result=%s, attempts=attempts-1 WHERE id=%s", ("risk: " + reason, task["id"]))
+            log(task["id"], acc_id, "risk", reason, path)
+            alert("risk", f"{ACCOUNT} -> risk: {reason}")
+
+
+        def main():
+            acc = q("SELECT * FROM accounts WHERE ig_username=%s", (ACCOUNT,), one=True)
+            if not acc:
+                sys.exit(f"účet {ACCOUNT} nie je v DB")
+            proxy = None
+            if os.environ.get("PROXY_SERVER"):
+                proxy = {"server": os.environ["PROXY_SERVER"],
+                         "username": os.environ.get("PROXY_USER", ""), "password": os.environ.get("PROXY_PASS", "")}
+
+            with sync_playwright() as p:
+                ctx = p.chromium.launch_persistent_context(
+                    PROFILE_DIR, headless=HEADLESS, proxy=proxy,
+                    locale=os.environ.get("LOCALE", "en-US"), viewport={"width": 1280, "height": 900})
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+                if len(sys.argv) > 1 and sys.argv[1] == "login":
+                    page.goto("https://www.instagram.com/")
+                    print("Prihlás sa ručne (vrátane 2FA). Po dokončení klikni Hotovo v rozhraní.", flush=True)
+                    import signal
+                    stop = {"v": False}
+                    signal.signal(signal.SIGTERM, lambda *a: stop.update(v=True))
+                    while ctx.pages and not stop["v"]:
+                        time.sleep(1)
+                    ctx.close()          # korektné ukončenie: uloží cookies/profil
+                    return
+
+                while True:
+                    acc = q("SELECT * FROM accounts WHERE id=%s", (acc["id"],), one=True)
+                    heartbeat(acc["id"])
+                    reap(acc["id"])
+                    if acc["status"] != "active" or not acc["brand_disclosed"] or not in_window(acc):
+                        time.sleep(IDLE_SLEEP); continue
+                    actions = allowed_actions(acc)
+                    task = claim(acc["id"], actions) if actions else None
+                    if not task:
+                        time.sleep(IDLE_SLEEP); continue
+                    log(task["id"], acc["id"], "claimed")
+                    try:
+                        ok, why = target_ok(task)
+                        if not ok:
+                            q("UPDATE tasks SET status='failed', finished_at=now(), result=%s WHERE id=%s", (why, task["id"]))
+                            log(task["id"], acc["id"], "failed", why); continue
+                        result = do_task(page, task, acc)
+                        path = shot(page, task["id"], "done")
+                        if acc["dry_run"]:   # dry-run nespotrebuje limity; úloha sa zruší, aby sa dala zadať znova
+                            q("UPDATE tasks SET status='cancelled', finished_at=now(), result=%s WHERE id=%s", (result, task["id"]))
+                            log(task["id"], acc["id"], "dry_run", None, path)
+                        else:
+                            col = "likes_today" if task["action"] == "like" else "comments_today"
+                            q(f"UPDATE accounts SET {col}={col}+1, last_action_at=now() WHERE id=%s", (acc["id"],))
+                            q("UPDATE tasks SET status='done', finished_at=now(), result=%s WHERE id=%s", (result, task["id"]))
+                            log(task["id"], acc["id"], "done", None, path)
+                    except NotAllowed as e:   # cieľ mimo allowlistu: bez opakovania
+                        q("UPDATE tasks SET status='failed', finished_at=now(), result=%s WHERE id=%s", (str(e), task["id"]))
+                        log(task["id"], acc["id"], "failed", str(e), shot(page, task["id"], "blocked"))
+                    except AmbiguousSubmit as e:   # nespoľahlivé: označ ako failed, operátor overí ručne
+                        path = shot(page, task["id"], "ambiguous")
+                        q("UPDATE tasks SET status='failed', finished_at=now(), result=%s WHERE id=%s", ("OVERIŤ RUČNE: " + str(e)[:400], task["id"]))
+                        log(task["id"], acc["id"], "ambiguous", str(e)[:500], path)
+                        alert("ambiguous", f"{ACCOUNT}: komentár #{task['id']} – over ručne na IG, či sa zverejnil")
+                    except RiskDetected as e:
+                        set_risk(acc["id"], task, str(e), page)   # zastav, nepokračuj, čaká na ručné odblokovanie
+                    except Exception as e:  # PWTimeout, RuntimeError, ...
+                        path = shot(page, task["id"], "err")
+                        final = task["attempts"] >= task["max_attempts"]
+                        q("UPDATE tasks SET status=%s, finished_at=CASE WHEN %s THEN now() END, result=%s WHERE id=%s",
+                          ("failed" if final else "pending", final, str(e)[:500], task["id"]))
+                        log(task["id"], acc["id"], "failed" if final else "retry", str(e)[:500], path)
+                    pause(acc)
+
+
+        if __name__ == "__main__":
+            main()
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/login.sh
+        #!/bin/bash
+        # Ručné prihlásenie účtu v kontajneri s virtuálnym displejom, dostupné cez noVNC na porte 6080.
+        # Spúšťa ho webové rozhranie (tlačidlo „Prihlásiť“). noVNC je dostupné len cez autentifikovaný Caddy (/novnc/).
+        export DISPLAY=:99 HEADLESS=false
+        Xvfb :99 -screen 0 1400x1000x24 &
+        sleep 2
+        openbox &                                   # jednoduchý správca okien (fokus klávesnice, zatváracie tlačidlo)
+        x11vnc -display :99 -nopw -localhost -forever -shared -rfbport 5900 -bg -quiet
+        websockify --web /usr/share/novnc 6080 localhost:5900 &
+        python worker.py login &
+        PY=$$!
+        trap 'kill -TERM $$PY 2>/dev/null' TERM INT   # docker stop -> korektné zatvorenie prehliadača
+        wait $$PY; wait $$PY 2>/dev/null
+        __IG_EOF__
+        RUN chmod +x /app/login.sh
+        HEALTHCHECK --interval=60s --timeout=5s --start-period=60s --retries=3 \
+          CMD python -c "import time,sys;sys.exit(0 if time.time()-float(open('/tmp/heartbeat').read())<180 else 1)"
+        CMD ["python", "worker.py"]
+
+  # ---- webové rozhranie + správa workerov + AI vrstva ----
+  manager:
+    image: ig-manager:1.1.0
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile_inline: |
+        # syntax=docker/dockerfile:1
+        FROM python:3.12-slim
+        WORKDIR /app
+        COPY <<"__IG_EOF__" /app/requirements.txt
+        fastapi==0.115.0
+        uvicorn==0.30.6
+        jinja2==3.1.4
+        python-multipart==0.0.9
+        psycopg2-binary==2.9.9
+        docker==7.1.0
+        requests==2.32.3
+        __IG_EOF__
+        RUN pip install --no-cache-dir -r requirements.txt
+        COPY <<"__IG_EOF__" /app/app.py
+        """Webové rozhranie (manager): správa účtov, workerov, úloh, schvaľovania a allowlistu."""
+        import hashlib, json, os, re, requests, time
+        from contextlib import asynccontextmanager
+        import psycopg2, psycopg2.extras
+        from fastapi import FastAPI, Form, HTTPException, Request
+        from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
+        from fastapi.templating import Jinja2Templates
+
+        import llm
+
+        try:
+            import docker
+            dc = docker.from_env()
+            dc.ping()
+        except Exception:          # beh bez Dockera (napr. testy) – správa workerov je vtedy vypnutá
+            docker, dc = None, None
+
+        DSN = os.environ["DATABASE_URL"]
+        WORKER_DSN = os.environ.get("WORKER_DATABASE_URL", "")
+        IMAGE = os.environ.get("WORKER_IMAGE", "ig-worker:latest")
+        NET = os.environ.get("NETWORK", "ig_net")
+        HOST_DATA = os.environ.get("HOST_DATA_DIR", "/data-root")
+        DATA_ROOT = "/data-root"
+        N8N_URL = os.environ.get("N8N_URL", "http://n8n:5678")
+        COMMAND_KEY = os.environ.get("COMMAND_KEY", "")
+        LOGIN_NAME = "ig-login"
+        VPN_IMAGE = os.environ.get("VPN_IMAGE", "qmcgaw/gluetun:v3")
+        VPN_PORT = 8888
+        VPN_TEST = "ig-vpn-test"
+        WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$$")
+        USER_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$$")
+        PassThrough = ("SEL_LIKE", "SEL_UNLIKE", "SEL_COMMENT", "POST_LABEL")
+
+        def seed_from_env():
+            """Počiatočné hodnoty z premenných prostredia (len ak sú tabuľky prázdne). Používa jednosúborový stack."""
+            split = lambda v: [x.strip().lstrip("@") for x in (v or "").split(",") if x.strip()]
+            try:
+                if not db("SELECT 1 FROM allowed_targets LIMIT 1", one=True):
+                    for a in split(os.environ.get("ALLOWED_AUTHORS")):
+                        db("INSERT INTO allowed_targets(kind,value) VALUES ('author',%s)", (a,))
+                    for p in [x.strip() for x in os.environ.get("ALLOWED_URL_PREFIXES", "").split(",") if x.strip()]:
+                        if not re.search(r"instagram\.com/?(p/?)?$$", p):
+                            db("INSERT INTO allowed_targets(kind,value) VALUES ('url_prefix',%s)", (p,))
+                if not db("SELECT 1 FROM blacklist LIMIT 1", one=True):
+                    for w in [x.strip() for x in os.environ.get("BLACKLIST_WORDS", "").split(",") if x.strip()]:
+                        db("INSERT INTO blacklist(kind,value) VALUES ('word',%s)", (w,))
+                k = os.environ.get("NORDVPN_PRIVATE_KEY", "").strip()
+                if k and WG_KEY_RE.match(k) and not db("SELECT 1 FROM settings WHERE key='vpn_wg_key'", one=True):
+                    db("INSERT INTO settings(key,value) VALUES ('vpn_wg_key',%s)", (k,))
+                m = os.environ.get("LOCAL_LLM_MODEL", "").strip()
+                if m and not db("SELECT 1 FROM settings WHERE key='ai_provider'", one=True):
+                    for k, v in (("ai_provider", "openai_compat"), ("ai_base_url", "http://ollama:11434/v1"), ("ai_model", m), ("ai_timeout_s", "600")):
+                        db("INSERT INTO settings(key,value) VALUES (%s,%s) ON CONFLICT (key) DO NOTHING", (k, v))
+            except Exception as e:
+                print("seed_from_env:", e, flush=True)
+
+
+        @asynccontextmanager
+        async def lifespan(_app):
+            seed_from_env()
+            yield
+
+
+        app = FastAPI(lifespan=lifespan)
+        templates = Jinja2Templates(directory="templates")
+
+
+        def db(sql, args=None, one=False):
+            conn = psycopg2.connect(DSN)
+            conn.autocommit = True
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(sql, args)
+                    if cur.description:
+                        return cur.fetchone() if one else cur.fetchall()
+            finally:
+                conn.close()
+
+
+        @app.middleware("http")
+        async def csrf_guard(request: Request, call_next):
+            if request.method == "POST" and not request.url.path.startswith("/api/"):
+                src = request.headers.get("origin") or request.headers.get("referer") or ""
+                host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+                if not host or host not in src:
+                    return PlainTextResponse("CSRF kontrola zlyhala", status_code=403)
+            return await call_next(request)
+
+
+        def render(request, name, **ctx):
+            ctx.setdefault("msg", request.query_params.get("msg"))
+            ctx.setdefault("err", request.query_params.get("err"))
+            ctx["docker_ok"] = dc is not None
+            return templates.TemplateResponse(request, name, ctx)
+
+
+        def back(url="/", msg=None, err=None):
+            q = ""
+            if msg: q = "?msg=" + requests.utils.quote(msg)
+            if err: q = "?err=" + requests.utils.quote(err)
+            return RedirectResponse(url.split("?")[0] + q, status_code=303)
+
+
+        # ------------------------------------------------------------------ Docker
+        def wname(u): return f"ig-worker-{u}"
+
+
+        def worker_states():
+            if not dc: return {}
+            out = {}
+            for c in dc.containers.list(all=True, filters={"label": "ig.managed=1"}):
+                health = c.attrs.get("State", {}).get("Health", {}).get("Status")
+                out[c.labels.get("ig.account")] = c.status + (f" ({health})" if health and c.status == "running" else "")
+            return out
+
+
+        def vname(u): return f"ig-vpn-{u}"
+
+
+        def get_setting(k, default=""):
+            row = db("SELECT value FROM settings WHERE key=%s", (k,), one=True)
+            return row["value"] if row else default
+
+
+        def put_setting(k, v):
+            db("INSERT INTO settings(key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+
+
+        def account_env(acc, proxy_url=""):
+            env = {"ACCOUNT_USERNAME": acc["ig_username"], "DATABASE_URL": WORKER_DSN,
+                   "N8N_ALERT_WEBHOOK": f"{N8N_URL}/webhook/risk-alert", "LOCALE": os.environ.get("IG_LOCALE", "en-US"),
+                   "HEADLESS": "true", "TZ": os.environ.get("TZ", "Europe/Bratislava"),
+                   "PROXY_SERVER": proxy_url, "PROXY_USER": "", "PROXY_PASS": ""}
+            for k in PassThrough:
+                if os.environ.get(k): env[k] = os.environ[k]
+            return env
+
+
+        def get_acc(aid):
+            acc = db("SELECT * FROM accounts WHERE id=%s", (aid,), one=True)
+            if not acc: raise HTTPException(404, "Účet neexistuje")
+            return acc
+
+
+        def remove_container(name):
+            if not dc: return
+            try:
+                dc.containers.get(name).remove(force=True)
+            except docker.errors.NotFound:
+                pass
+
+
+        def stop_remove(name, timeout=30):
+            """Korektné zastavenie (SIGTERM, počká na uloženie profilu), potom odstránenie."""
+            if not dc: return
+            try: c = dc.containers.get(name)
+            except docker.errors.NotFound: return
+            try: c.stop(timeout=timeout)
+            except Exception: pass
+            try: c.remove(force=True)
+            except Exception: pass
+
+
+        # ---- NordVPN cez gluetun (WireGuard / NordLynx). Každý účet má vlastný VPN kontajner s vnútornou HTTP proxy;
+        # ---- worker ide cez ňu. Keď VPN nebeží, worker nemá spojenie (nikdy nejde z IP servera).
+        def vpn_env(country, city, hostname, key):
+            env = {"VPN_SERVICE_PROVIDER": "nordvpn", "VPN_TYPE": "wireguard", "WIREGUARD_PRIVATE_KEY": key,
+                   "HTTPPROXY": "on", "HTTPPROXY_LISTENING_ADDRESS": f":{VPN_PORT}", "TZ": os.environ.get("TZ", "Etc/UTC")}
+            if country: env["SERVER_COUNTRIES"] = country
+            if city: env["SERVER_CITIES"] = city
+            if hostname: env["SERVER_HOSTNAMES"] = hostname
+            return env
+
+
+        def exit_ip(proxy_url):
+            last = None
+            for _ in range(4):
+                try:
+                    return requests.get("https://api.ipify.org", proxies={"http": proxy_url, "https": proxy_url}, timeout=15).text.strip()
+                except Exception as e:
+                    last = e; time.sleep(3)
+            raise RuntimeError(f"cez VPN sa nepodarilo zistiť výstupnú IP: {last}")
+
+
+        def ensure_vpn(name, country, city, hostname, timeout=150):
+            """Spustí (alebo znova použije) kontajner gluetun s NordVPN. Vráti (proxy_url, výstupná_IP)."""
+            if not dc: raise RuntimeError("Docker nie je dostupný")
+            key = get_setting("vpn_wg_key")
+            if not key: raise RuntimeError("Chýba NordVPN WireGuard kľúč. Nastav ho v menu „VPN“.")
+            env = vpn_env(country, city, hostname, key)
+            cfg = hashlib.sha1(json.dumps(env, sort_keys=True).encode()).hexdigest()[:16]
+            c = None
+            try:
+                c = dc.containers.get(name)
+                if c.labels.get("ig.vpncfg") != cfg or c.status != "running":
+                    c.remove(force=True); c = None
+            except docker.errors.NotFound:
+                pass
+            if c is None:
+                c = dc.containers.run(VPN_IMAGE, name=name, detach=True, cap_add=["NET_ADMIN"],
+                                      devices=["/dev/net/tun:/dev/net/tun"], environment=env, network=NET,
+                                      restart_policy={"Name": "unless-stopped"}, labels={"ig.vpn": name, "ig.vpncfg": cfg})
+            t0 = time.time()
+            while True:
+                c.reload()
+                tail = lambda: c.logs(tail=6).decode(errors="ignore")[-400:]
+                if c.status in ("exited", "dead"):
+                    raise RuntimeError("VPN kontajner skončil: " + tail())
+                if c.attrs.get("State", {}).get("Health", {}).get("Status") == "healthy":
+                    break
+                if time.time() - t0 > timeout:
+                    raise RuntimeError(f"VPN sa nepripojila do {timeout} s: " + tail())
+                time.sleep(3)
+            proxy = f"http://{name}:{VPN_PORT}"
+            return proxy, exit_ip(proxy)
+
+
+        def vpn_up(acc):
+            """Zabezpečí VPN pre účet. Vráti (proxy_url, výstupná_IP); pri režime bez VPN ('', '')."""
+            if acc["vpn_mode"] != "nordvpn": return "", ""
+            proxy, ip = ensure_vpn(vname(acc["ig_username"]), acc["vpn_country"], acc["vpn_city"], acc["vpn_hostname"])
+            db("UPDATE accounts SET exit_ip=%s WHERE id=%s", (ip, acc["id"]))
+            return proxy, ip
+
+
+        def dup_ip_warning(acc, ip):
+            if not ip: return ""
+            rows = db("SELECT ig_username FROM accounts WHERE exit_ip=%s AND id<>%s AND NOT archived", (ip, acc["id"]))
+            return (f" POZOR: rovnakú výstupnú IP {ip} má aj " + ", ".join(r["ig_username"] for r in rows) +
+                    ". Nastav inú krajinu/mesto/server.") if rows else ""
+
+
+        def start_worker(acc):
+            """Spustí VPN (ak je zapnutá) a worker účtu. Vráti prípadné varovanie."""
+            if not dc: raise RuntimeError("Docker nie je dostupný")
+            u = acc["ig_username"]
+            proxy, ip = vpn_up(acc)
+            remove_container(wname(u))
+            os.makedirs(f"{DATA_ROOT}/{u}", exist_ok=True)
+            dc.containers.run(IMAGE, name=wname(u), hostname=wname(u), detach=True, environment=account_env(acc, proxy),
+                              network=NET, shm_size="1g", restart_policy={"Name": "unless-stopped"},
+                              volumes={f"{HOST_DATA}/{u}": {"bind": "/data", "mode": "rw"}},
+                              labels={"ig.managed": "1", "ig.account": u})
+            return dup_ip_warning(acc, ip)
+
+
+        def vpn_states():
+            if not dc: return {}
+            out = {}
+            for c in dc.containers.list(all=True, filters={"label": "ig.vpn"}):
+                name = c.labels.get("ig.vpn", "")
+                if name.startswith("ig-vpn-") and name != VPN_TEST:
+                    health = c.attrs.get("State", {}).get("Health", {}).get("Status")
+                    out[name[len("ig-vpn-"):]] = c.status + (f" ({health})" if health else "")
+            return out
+
+
+        def host_memory():
+            try:
+                m = {l.split(":")[0]: int(l.split()[1]) for l in open("/proc/meminfo")}
+                return round(m["MemTotal"] / 1048576, 1), round(m["MemAvailable"] / 1048576, 1)
+            except Exception:
+                return None, None
+
+
+        # ------------------------------------------------------------------ stránky
+        @app.get("/", response_class=HTMLResponse)
+        def dashboard(request: Request):
+            accounts = db("""SELECT a.*, to_char(last_seen,'HH24:MI:SS') seen_s,
+                                    coalesce(extract(epoch from now()-last_seen),99999)::int seen_age
+                             FROM accounts a WHERE NOT archived ORDER BY id""")
+            states = worker_states()
+            vstates = vpn_states()
+            pending = db("""SELECT t.id, a.ig_username, t.post_url, t.comment_text, t.post_context
+                            FROM tasks t JOIN accounts a ON a.id=t.account_id WHERE t.status='awaiting_approval' ORDER BY t.id""")
+            stats = db("""SELECT count(*) FILTER (WHERE status='done' AND finished_at::date=current_date) done,
+                                 count(*) FILTER (WHERE status='failed' AND finished_at::date=current_date) failed,
+                                 count(*) FILTER (WHERE status='pending') queued FROM tasks""", one=True)
+            total, avail = host_memory()
+            c = ai_cfg()
+            return render(request, "dashboard.html", ai_model=f"{c['ai_provider']} / {c['ai_model']}", accounts=accounts, states=states, vstates=vstates, default_country=os.environ.get("VPN_COUNTRIES", ""), default_city=os.environ.get("VPN_CITIES", ""), pending=pending, stats=stats,
+                          mem_total=total, mem_avail=avail, n_workers=sum(1 for s in states.values() if s.startswith("running")))
+
+
+        def _vpn_fields(mode, country, city, hostname):
+            mode = mode if mode in ("nordvpn", "none") else "nordvpn"
+            country, city, hostname = country.strip(), city.strip(), hostname.strip().lower()
+            if mode == "nordvpn" and not country:
+                raise ValueError("Zadaj krajinu servera NordVPN (napr. Slovakia).")
+            if hostname and not re.match(r"^[a-z0-9.-]+\.nordvpn\.com$$", hostname):
+                raise ValueError("Hostname servera musí mať tvar napr. sk123.nordvpn.com")
+            return mode, country, city, hostname
+
+
+        @app.post("/accounts/add")
+        def add_account(username: str = Form(...), vpn_mode: str = Form("nordvpn"), vpn_country: str = Form(""),
+                        vpn_city: str = Form(""), start: str = Form(""), external: str = Form("")):
+            u = username.strip().lstrip("@").lower()
+            if not USER_RE.match(u): return back("/", err="Neplatné používateľské meno")
+            try:
+                mode, country, city, host = _vpn_fields("none" if external else vpn_mode, vpn_country, vpn_city, "")
+            except ValueError as e:
+                return back("/", err=str(e))
+            row = db("""INSERT INTO accounts(ig_username, managed_locally, vpn_mode, vpn_country, vpn_city) VALUES (%s,%s,%s,%s,%s)
+                        ON CONFLICT (ig_username) DO UPDATE SET archived=false, managed_locally=EXCLUDED.managed_locally,
+                        vpn_mode=EXCLUDED.vpn_mode, vpn_country=EXCLUDED.vpn_country, vpn_city=EXCLUDED.vpn_city
+                        RETURNING id""", (u, not external, mode, country, city), one=True)
+            warn = ""
+            if start and not external:
+                if mode == "nordvpn" and not get_setting("vpn_wg_key"):
+                    return back("/", err="Účet pridaný, ale chýba NordVPN kľúč: nastav ho v menu VPN a potom klikni Štart.")
+                try:
+                    warn = start_worker(get_acc(row["id"]))
+                except Exception as e:
+                    return back("/", err=f"Účet pridaný, worker sa nespustil: {e}")
+            return back("/", msg=f"Účet {u} pridaný. Ďalší krok: Prihlásiť." + warn)
+
+
+        @app.post("/accounts/{aid}/worker/{op}")
+        def worker_op(aid: int, op: str):
+            acc = get_acc(aid)
+            try:
+                if op in ("start", "restart"):
+                    warn = start_worker(acc)
+                elif op == "stop":
+                    warn = ""
+                    if dc:
+                        try: dc.containers.get(wname(acc["ig_username"])).stop(timeout=20)
+                        except Exception: pass
+                        stop_remove(vname(acc["ig_username"]), timeout=10)        # uvoľní NordVPN pripojenie
+            except Exception as e:
+                return back("/", err=str(e))
+            return back("/", msg=f"Worker {acc['ig_username']}: {op}" + warn)
+
+
+        @app.post("/accounts/{aid}/status/{op}")
+        def status_op(aid: int, op: str, confirm: str = Form("")):
+            acc = db("SELECT * FROM accounts WHERE id=%s", (aid,), one=True)
+            if op == "activate":
+                if not confirm: return back("/", err="Treba potvrdiť, že účet je zjavne značkový.")
+                db("UPDATE accounts SET status='active', brand_disclosed=true WHERE id=%s", (aid,))
+            elif op == "pause": db("UPDATE accounts SET status='paused' WHERE id=%s", (aid,))
+            elif op == "unblock": db("UPDATE accounts SET status='active', risk_reason=NULL WHERE id=%s AND status='risk'", (aid,))
+            elif op == "golive":
+                if not confirm: return back("/", err="Treba potvrdiť zapnutie reálnych akcií.")
+                db("UPDATE accounts SET dry_run=false WHERE id=%s", (aid,))
+            elif op == "dryrun": db("UPDATE accounts SET dry_run=true WHERE id=%s", (aid,))
+            return back("/", msg=f"{acc['ig_username']}: {op}")
+
+
+        @app.get("/accounts/{aid}", response_class=HTMLResponse)
+        def account_page(request: Request, aid: int):
+            return render(request, "account.html", a=get_acc(aid), has_key=bool(get_setting("vpn_wg_key")))
+
+
+        @app.post("/accounts/{aid}/edit")
+        def account_edit(aid: int, daily_like_limit: int = Form(...), daily_comment_limit: int = Form(...),
+                         hourly_action_limit: int = Form(...), active_from: str = Form(...), active_to: str = Form(...),
+                         tz: str = Form(...), pause_min_s: float = Form(...), pause_max_s: float = Form(...),
+                         vpn_mode: str = Form("nordvpn"), vpn_country: str = Form(""), vpn_city: str = Form(""),
+                         vpn_hostname: str = Form("")):
+            if active_from >= active_to: return back(f"/accounts/{aid}", err="Okno aktivity: 'od' musí byť skôr ako 'do'.")
+            if pause_min_s > pause_max_s: return back(f"/accounts/{aid}", err="Pauza min nesmie byť väčšia ako max.")
+            old = get_acc(aid)
+            try:
+                mode, country, city, host = _vpn_fields("none" if not old["managed_locally"] else vpn_mode, vpn_country, vpn_city, vpn_hostname)
+            except ValueError as e:
+                return back(f"/accounts/{aid}", err=str(e))
+            db("""UPDATE accounts SET daily_like_limit=%s, daily_comment_limit=%s, hourly_action_limit=%s,
+                  active_from=%s, active_to=%s, tz=%s, pause_min_s=%s, pause_max_s=%s,
+                  vpn_mode=%s, vpn_country=%s, vpn_city=%s, vpn_hostname=%s WHERE id=%s""",
+               (daily_like_limit, daily_comment_limit, hourly_action_limit, active_from, active_to, tz, pause_min_s, pause_max_s,
+                mode, country, city, host, aid))
+            msg = "Uložené."
+            if (old["vpn_mode"], old["vpn_country"], old["vpn_city"], old["vpn_hostname"]) != (mode, country, city, host):
+                try:
+                    acc = get_acc(aid)
+                    if mode == "none": stop_remove(vname(acc["ig_username"]), timeout=10)
+                    if dc and acc["managed_locally"] and wname(acc["ig_username"]) in [c.name for c in dc.containers.list(all=True)]:
+                        msg += " Worker reštartovaný s novým pripojením." + start_worker(acc)
+                except Exception as e:
+                    return back(f"/accounts/{aid}", err=f"Uložené, ale reštart zlyhal: {e}")
+            return back(f"/accounts/{aid}", msg=msg)
+
+
+        @app.post("/accounts/{aid}/delete")
+        def account_delete(aid: int, confirm: str = Form("")):
+            if not confirm: return back("/", err="Treba potvrdiť odstránenie.")
+            acc = get_acc(aid)
+            remove_container(wname(acc["ig_username"]))
+            remove_container(vname(acc["ig_username"]))
+            db("UPDATE accounts SET archived=true, status='paused', exit_ip=NULL WHERE id=%s", (aid,))
+            db("UPDATE tasks SET status='cancelled', result='účet odstránený' WHERE account_id=%s AND status IN ('pending','awaiting_approval')", (aid,))
+            return back("/", msg=f"Účet {acc['ig_username']} odstránený (história ostáva).")
+
+
+        # --- prihlásenie účtu cez noVNC (ide cez rovnakú VPN ako worker)
+        @app.post("/accounts/{aid}/login")
+        def login_start(aid: int):
+            if not dc: return back("/", err="Docker nie je dostupný")
+            acc = get_acc(aid)
+            u = acc["ig_username"]
+            stop_remove(LOGIN_NAME)
+            try: dc.containers.get(wname(u)).stop(timeout=20)
+            except Exception: pass
+            try:
+                proxy, _ip = vpn_up(acc)
+            except Exception as e:
+                return back("/", err=f"VPN sa nespustila: {e}")
+            os.makedirs(f"{DATA_ROOT}/{u}", exist_ok=True)
+            dc.containers.run(IMAGE, name=LOGIN_NAME, command=["./login.sh"], detach=True, environment=account_env(acc, proxy),
+                              network=NET, shm_size="1g", volumes={f"{HOST_DATA}/{u}": {"bind": "/data", "mode": "rw"}},
+                              labels={"ig.login": u})
+            return back(f"/login/{aid}")
+
+
+        @app.get("/login/{aid}", response_class=HTMLResponse)
+        def login_page(request: Request, aid: int):
+            acc = db("SELECT * FROM accounts WHERE id=%s", (aid,), one=True)
+            state = None
+            if dc:
+                try: state = dc.containers.get(LOGIN_NAME).status
+                except Exception: state = "none"
+            return render(request, "login.html", a=acc, state=state)
+
+
+        @app.post("/accounts/{aid}/login/done")
+        def login_done(aid: int):
+            stop_remove(LOGIN_NAME)
+            acc = get_acc(aid)
+            warn = ""
+            if acc["managed_locally"]:
+                try: warn = start_worker(acc)
+                except Exception as e: return back("/", err=f"Worker sa nespustil: {e}")
+            return back("/", msg=f"Prihlásenie {acc['ig_username']} ukončené, worker beží." + warn)
+
+
+        # --- úlohy
+        @app.get("/tasks", response_class=HTMLResponse)
+        def tasks_page(request: Request, status: str = ""):
+            rows = db("""SELECT t.id, a.ig_username, t.post_url, t.action, t.comment_text, t.status, t.attempts,
+                                left(coalesce(t.result,''),80) result, to_char(t.created_at,'MM-DD HH24:MI') created
+                         FROM tasks t JOIN accounts a ON a.id=t.account_id
+                         WHERE (%s='' OR t.status=%s) ORDER BY t.id DESC LIMIT 200""", (status, status))
+            accounts = db("SELECT id, ig_username FROM accounts WHERE NOT archived ORDER BY id")
+            return render(request, "tasks.html", rows=rows, accounts=accounts, status=status)
+
+
+        @app.post("/tasks/new")
+        def task_new(account_id: int = Form(...), post_url: str = Form(...), action: str = Form(...),
+                     comment_text: str = Form(""), post_context: str = Form("")):
+            url = post_url.strip()
+            if not re.match(r"^https://(www\.)?instagram\.com/", url): return back("/tasks", err="URL musí byť z instagram.com")
+            if action not in ("like", "comment"): return back("/tasks", err="Neplatná akcia")
+            if action == "comment" and not comment_text.strip(): return back("/tasks", err="Komentár nemá text")
+            try:
+                db("""INSERT INTO tasks(account_id,post_url,post_context,action,comment_text,status,requested_by)
+                      VALUES (%s,%s,%s,%s,%s,%s,'gui')""",
+                   (account_id, url, post_context.strip() or None, action, comment_text.strip() if action == "comment" else None,
+                    "awaiting_approval" if action == "comment" else "pending"))
+            except psycopg2.errors.UniqueViolation:
+                return back("/tasks", err="Duplicita: rovnaký text komentára alebo rovnaká akcia na tento príspevok už existuje.")
+            return back("/tasks", msg="Úloha vytvorená" + (" – čaká na schválenie." if action == "comment" else "."))
+
+
+        @app.post("/tasks/{tid}/{op}")
+        def task_op(tid: int, op: str, next: str = Form("/")):
+            if op == "approve":
+                db("""UPDATE tasks SET status='pending', approved_by='gui', approved_at=now()
+                      WHERE id=%s AND status='awaiting_approval'""", (tid,))
+            elif op in ("reject", "cancel"):
+                db("UPDATE tasks SET status='cancelled', result=%s WHERE id=%s AND status IN ('awaiting_approval','pending')",
+                   ("zamietnuté operátorom", tid))
+            dest = next if next.startswith("/") and not next.startswith("//") else "/"
+            return back(dest, msg=f"Úloha #{tid}: {op}")
+
+
+        # ------------------------------------------------------------------ NordVPN nastavenia
+        def fetch_nordlynx_key(token):
+            """Získa WireGuard (NordLynx) privátny kľúč z NordVPN access tokenu. Token sa neukladá."""
+            r = requests.get("https://api.nordvpn.com/v1/users/services/credentials", auth=("token", token.strip()), timeout=20)
+            if r.status_code in (401, 403): raise ValueError("NordVPN odmietol token (neplatný alebo expirovaný).")
+            r.raise_for_status()
+            k = (r.json() or {}).get("nordlynx_private_key", "")
+            if not WG_KEY_RE.match(k or ""): raise ValueError("NordVPN nevrátil NordLynx kľúč.")
+            return k
+
+
+        @app.get("/settings/vpn", response_class=HTMLResponse)
+        def vpn_page(request: Request):
+            return render(request, "vpn.html", has_key=bool(get_setting("vpn_wg_key")),
+                          countries=os.environ.get("VPN_COUNTRIES", ""), cities=os.environ.get("VPN_CITIES", ""),
+                          vstates=vpn_states(), accounts=db("SELECT ig_username, vpn_country, vpn_city, vpn_hostname, exit_ip FROM accounts WHERE NOT archived AND vpn_mode='nordvpn' ORDER BY id"))
+
+
+        @app.post("/settings/vpn/save")
+        def vpn_save(private_key: str = Form(""), access_token: str = Form(""), clear_key: str = Form("")):
+            if clear_key:
+                db("DELETE FROM settings WHERE key='vpn_wg_key'")
+                return back("/settings/vpn", msg="Kľúč zmazaný. VPN kontajnery bežia, kým ich nezastavíš.")
+            try:
+                if access_token.strip():
+                    key = fetch_nordlynx_key(access_token)
+                elif private_key.strip():
+                    key = private_key.strip()
+                    if not WG_KEY_RE.match(key): raise ValueError("Neplatný WireGuard kľúč (očakáva sa 44 znakov base64 zakončených '=').")
+                else:
+                    return back("/settings/vpn", err="Vlož kľúč alebo access token.")
+            except Exception as e:
+                return back("/settings/vpn", err=str(e))
+            put_setting("vpn_wg_key", key)
+            return back("/settings/vpn", msg="NordVPN kľúč uložený.")
+
+
+        @app.post("/settings/vpn/test")
+        def vpn_test(country: str = Form(...), city: str = Form("")):
+            try:
+                proxy, ip = ensure_vpn(VPN_TEST, country.strip(), city.strip(), "")
+                stop_remove(VPN_TEST, timeout=10)
+                return back("/settings/vpn", msg=f"NordVPN funguje. Výstupná IP: {ip} ({country.strip()}).")
+            except Exception as e:
+                stop_remove(VPN_TEST, timeout=5)
+                return back("/settings/vpn", err=f"Test VPN zlyhal: {e}")
+
+
+        # ------------------------------------------------------------------ AI model + šéf-agent
+        PROMPT_FILE = "/prompts/boss_agent.md"
+        MAX_TASKS = 20
+        MAX_COMMENT = 300
+        URL_RE = re.compile(r"^https://(www\.)?instagram\.com/(?:[A-Za-z0-9._]+/)?(p|reel|tv)/[A-Za-z0-9_-]+/?$$")
+
+
+        def ai_cfg():
+            db("CREATE TABLE IF NOT EXISTS settings (key text PRIMARY KEY, value text NOT NULL)")
+            cfg = dict(llm.DEFAULTS)
+            stored = {r["key"]: r["value"] for r in db("SELECT key,value FROM settings WHERE key LIKE 'ai\\_%'")}
+            cfg.update(stored)
+            # kľúč z prostredia sa použije len pre Claude na oficiálnej adrese, nikdy pre iný server
+            if not cfg["ai_api_key"] and cfg["ai_provider"] == "anthropic" and not cfg["ai_base_url"] and os.environ.get("ANTHROPIC_API_KEY"):
+                cfg["ai_api_key"] = os.environ["ANTHROPIC_API_KEY"]
+            return cfg
+
+
+        def default_prompt():
+            try: return open(PROMPT_FILE, encoding="utf-8").read()
+            except Exception: return "Si šéf-agent. Vráť iba JSON {\"tasks\": [], \"rejected\": [], \"notes\": \"\"}."
+
+
+        def get_prompt():
+            row = db("SELECT value FROM settings WHERE key='ai_prompt'", one=True)
+            return row["value"] if row and row["value"].strip() else default_prompt()
+
+
+        def agent_context():
+            accounts = db("""SELECT a.id, a.ig_username AS username,
+                a.daily_like_limit - a.likes_today - coalesce(q.likes,0) AS likes_left,
+                a.daily_comment_limit - a.comments_today - coalesce(q.comments,0) AS comments_left
+                FROM accounts a LEFT JOIN (SELECT account_id, count(*) FILTER (WHERE action='like') likes,
+                     count(*) FILTER (WHERE action='comment') comments FROM tasks
+                     WHERE status IN ('pending','awaiting_approval','in_progress') GROUP BY 1) q ON q.account_id=a.id
+                WHERE NOT a.archived AND a.status='active' AND a.brand_disclosed ORDER BY a.id""")
+            return {"accounts": accounts,
+                    "allowlist": [{"kind": r["kind"], "value": r["value"]} for r in db("SELECT kind,value FROM allowed_targets")],
+                    "blacklist": [{"kind": r["kind"], "value": r["value"]} for r in db("SELECT kind,value FROM blacklist")],
+                    "recent_comments": [r["comment_text"] for r in db(
+                        "SELECT comment_text FROM tasks WHERE action='comment' ORDER BY id DESC LIMIT 40")]}
+
+
+        def plan_and_create(command, requested_by):
+            """Príkaz -> LLM -> prísna kontrola v kóde -> úlohy v DB. Bezpečnostné pravidlá nezávisia od kvality modelu."""
+            cfg = ai_cfg()
+            ctx = agent_context()
+            if not ctx["accounts"]:
+                raise llm.LLMError("Žiadny aktívny značkový účet. Aktivuj aspoň jeden účet.")
+            public_ctx = {k: ([{kk: vv for kk, vv in a.items() if kk != "id"} for a in v] if k == "accounts" else v) for k, v in ctx.items()}
+            user = ("PRÍKAZ OPERÁTORA:\n" + command + "\n\nKONTEXT (JSON):\n" + json.dumps(public_ctx, ensure_ascii=False) +
+                    "\n\nOdpovedz IBA jedným platným JSON objektom podľa zadaného formátu, bez ďalšieho textu.")
+            system = get_prompt()
+            out, last_err = None, None
+            for attempt in range(2):                      # druhý pokus pri nevalidnom JSON (typické pre menšie lokálne modely)
+                text, secs = llm.chat(cfg, system, user if attempt == 0 else user + "\n\nPredchádzajúca odpoveď nebola platný JSON. Vráť IBA JSON objekt.")
+                try:
+                    out = llm.extract_json(text); break
+                except Exception as e:
+                    last_err = e
+            if out is None:
+                raise llm.LLMError(f"Model nevrátil platný JSON ({last_err}). Skús schopnejší model.")
+
+            by_name = {a["username"].lower(): a for a in ctx["accounts"]}
+            black = ctx["blacklist"]
+            left = {a["username"]: {"like": a["likes_left"], "comment": a["comments_left"]} for a in ctx["accounts"]}
+            created, rejected = [], [{"post_url": str(r.get("post_url", "")), "reason": "model: " + str(r.get("reason", ""))}
+                                      for r in (out.get("rejected") or []) if isinstance(r, dict)]
+            for t in (out.get("tasks") or [])[:MAX_TASKS * 2]:
+                if len(created) >= MAX_TASKS:
+                    rejected.append({"post_url": str(t.get("post_url", "")), "reason": f"limit {MAX_TASKS} úloh na príkaz"}); continue
+                try:
+                    action = str(t.get("action", "")).strip()
+                    acc = by_name.get(str(t.get("account", "")).strip().lstrip("@").lower())
+                    url = str(t.get("post_url", "")).split("?")[0].split("#")[0].strip()
+                    url = url if url.endswith("/") else url + "/"
+                    text = (t.get("comment_text") or "").strip() if action == "comment" else None
+                    ctxt = (str(t.get("post_context") or "").strip() or None)
+                    why = None
+                    if action not in ("like", "comment"): why = "neplatná akcia"
+                    elif not acc: why = "účet neexistuje alebo nie je aktívny/značkový"
+                    elif not URL_RE.match(url): why = "neplatná URL príspevku"
+                    elif any(b["kind"] == "post_url" and b["value"].rstrip("/") == url.rstrip("/") for b in black): why = "príspevok je na blackliste"
+                    elif left[acc["username"]][action] <= 0: why = "vyčerpaný limit účtu"
+                    elif action == "comment":
+                        if not text: why = "prázdny komentár"
+                        elif len(text) > MAX_COMMENT: why = f"komentár dlhší ako {MAX_COMMENT} znakov"
+                        elif re.search(r"https?://|www\.", text, re.I): why = "komentár obsahuje odkaz"
+                        elif any(b["kind"] == "word" and b["value"].lower() in text.lower() for b in black): why = "slovo z blacklistu"
+                        elif db("""SELECT 1 FROM tasks WHERE action='comment' AND post_url=%s
+                                   AND status NOT IN ('failed','cancelled')""", (url,), one=True): why = "na tento príspevok už komentár existuje"
+                    if why:
+                        rejected.append({"post_url": url, "reason": why}); continue
+                    row = db("""INSERT INTO tasks(account_id,post_url,post_context,action,comment_text,status,requested_by)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id""",
+                             (acc["id"], url, ctxt, action, text, "awaiting_approval" if action == "comment" else "pending", requested_by), one=True)
+                    if not row:
+                        rejected.append({"post_url": url, "reason": "duplicita (rovnaký text alebo akcia už existuje)"}); continue
+                    left[acc["username"]][action] -= 1
+                    created.append({"id": row["id"], "account": acc["username"], "action": action, "post_url": url, "comment_text": text})
+                except Exception as e:
+                    rejected.append({"post_url": str(t.get("post_url", "")) if isinstance(t, dict) else "", "reason": f"chyba spracovania: {e}"})
+            return {"created": created, "rejected": rejected, "notes": str(out.get("notes") or ""),
+                    "model": f"{cfg['ai_provider']}/{cfg['ai_model']}", "seconds": round(secs, 1)}
+
+
+        @app.post("/api/agent")                          # volá n8n (intake workflow); chránené kľúčom
+        async def api_agent(request: Request):
+            if not COMMAND_KEY or request.headers.get("x-api-key") != COMMAND_KEY:
+                return PlainTextResponse("neautorizované", status_code=401)
+            body = await request.json()
+            try:
+                return plan_and_create(str(body.get("command", "")), str(body.get("requested_by", "api")))
+            except Exception as e:
+                return PlainTextResponse(str(e), status_code=502)
+
+
+        @app.post("/agent")
+        def agent(command: str = Form(...)):
+            try:
+                r = plan_and_create(command, "gui")
+            except Exception as e:
+                return back("/", err=f"Šéf-agent zlyhal: {e}")
+            msg = f"Vytvorených úloh: {len(r['created'])} (model {r['model']}, {r['seconds']} s)."
+            if any(c["action"] == "comment" for c in r["created"]): msg += " Komentáre čakajú na schválenie."
+            if r["rejected"]: msg += " Zamietnuté: " + "; ".join(f"{x['reason']}" for x in r["rejected"][:5])
+            return back("/", msg=msg)
+
+
+        @app.get("/settings/ai", response_class=HTMLResponse)
+        def ai_page(request: Request):
+            cfg = ai_cfg()
+            return render(request, "ai.html", cfg=cfg, has_key=bool(cfg["ai_api_key"]), models=llm.list_models(cfg),
+                          prompt=get_prompt(), custom_prompt=bool(db("SELECT 1 FROM settings WHERE key='ai_prompt'", one=True)))
+
+
+        def _form_cfg(old, provider, base_url, model, api_key, temperature, max_tokens, timeout_s, json_mode):
+            if provider not in llm.PROVIDERS: raise ValueError("Neplatný provider")
+            if provider == "openai_compat" and not base_url.strip().startswith("http"): raise ValueError("Zadaj base URL (http://… alebo https://…)")
+            if not model.strip(): raise ValueError("Zadaj názov modelu")
+            if temperature.strip(): float(temperature)
+            cfg = dict(old)
+            cfg.update(ai_provider=provider, ai_base_url=base_url.strip(), ai_model=model.strip(), ai_temperature=temperature.strip(),
+                       ai_max_tokens=str(int(max_tokens)), ai_timeout_s=str(int(timeout_s)), ai_json_mode="1" if json_mode else "0")
+            if api_key:
+                cfg["ai_api_key"] = api_key
+            elif (old["ai_provider"], old["ai_base_url"].rstrip("/")) != (provider, base_url.strip().rstrip("/")):
+                cfg["ai_api_key"] = ""        # zmena providera/adresy: starý kľúč sa NEPRENÁŠA na iný server
+            return cfg
+
+
+        @app.post("/settings/ai/save")
+        def ai_save(provider: str = Form(...), base_url: str = Form(""), model: str = Form(...), api_key: str = Form(""),
+                    temperature: str = Form(""), max_tokens: int = Form(2000), timeout_s: int = Form(180),
+                    json_mode: str = Form(""), prompt: str = Form(""), clear_key: str = Form("")):
+            old_cfg = ai_cfg()
+            try:
+                cfg = _form_cfg(old_cfg, provider, base_url, model, api_key, temperature, max_tokens, timeout_s, json_mode)
+            except ValueError as e:
+                return back("/settings/ai", err=str(e))
+            if clear_key: cfg["ai_api_key"] = ""
+            dropped = bool(old_cfg["ai_api_key"]) and not cfg["ai_api_key"] and not clear_key
+            for k, v in cfg.items():
+                if k.startswith("ai_"):
+                    db("INSERT INTO settings(key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+            if prompt.strip() and prompt.strip() != default_prompt().strip():
+                db("INSERT INTO settings(key,value) VALUES ('ai_prompt',%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (prompt,))
+            else:
+                db("DELETE FROM settings WHERE key='ai_prompt'")
+            return back("/settings/ai", msg="Nastavenie AI modelu uložené." + (" Uložený API kľúč bol zmazaný, lebo sa zmenil provider/adresa. Zadaj nový, ak ho server vyžaduje." if dropped else ""))
+
+
+        @app.post("/settings/ai/test")
+        def ai_test(provider: str = Form(...), base_url: str = Form(""), model: str = Form(...), api_key: str = Form(""),
+                    temperature: str = Form(""), max_tokens: int = Form(2000), timeout_s: int = Form(180), json_mode: str = Form("")):
+            try:
+                cfg = _form_cfg(ai_cfg(), provider, base_url, model, api_key, temperature, max_tokens, timeout_s, json_mode)
+                text, secs = llm.chat(cfg, "Odpovedaj iba platným JSON objektom.", 'Vráť presne {"ok": true, "jazyk": "sk"} a nič iné.')
+                try: llm.extract_json(text); fmt = "JSON je platný"
+                except Exception: fmt = "POZOR: odpoveď nie je platný JSON – model môže byť pre šéf-agenta slabý"
+                return back("/settings/ai", msg=f"Spojenie OK ({secs:.1f} s). {fmt}. Odpoveď: {text.strip()[:120]}")
+            except Exception as e:
+                return back("/settings/ai", err=f"Test zlyhal: {e}")
+
+
+        # --- logy, screenshoty
+        @app.get("/logs", response_class=HTMLResponse)
+        def logs_page(request: Request):
+            rows = db("""SELECT to_char(l.created_at,'MM-DD HH24:MI:SS') t, a.ig_username, l.task_id, l.event,
+                                left(coalesce(l.error,''),160) error, l.screenshot_url
+                         FROM logs l LEFT JOIN accounts a ON a.id=l.account_id ORDER BY l.id DESC LIMIT 200""")
+            for r in rows:
+                r["shot"] = os.path.basename(r["screenshot_url"]) if r["screenshot_url"] else None
+            return render(request, "logs.html", rows=rows)
+
+
+        @app.get("/shots/{username}/{fname}")
+        def shot(username: str, fname: str):
+            if not USER_RE.match(username) or "/" in fname or ".." in fname: return PlainTextResponse("nie", 400)
+            path = f"{DATA_ROOT}/{username}/screenshots/{fname}"
+            return FileResponse(path) if os.path.isfile(path) else PlainTextResponse("nenájdené", 404)
+
+
+        # --- nastavenia: allowlist / blacklist
+        @app.get("/settings", response_class=HTMLResponse)
+        def settings_page(request: Request):
+            return render(request, "settings.html", allow=db("SELECT * FROM allowed_targets ORDER BY id"),
+                          black=db("SELECT * FROM blacklist ORDER BY id"))
+
+
+        @app.post("/settings/allow/add")
+        def allow_add(kind: str = Form(...), value: str = Form(...)):
+            v = value.strip().lstrip("@") if kind == "author" else value.strip()
+            if kind not in ("author", "url_prefix") or not v: return back("/settings", err="Neplatný záznam")
+            if kind == "url_prefix" and re.search(r"instagram\.com/?(p/?)?$$", v):
+                return back("/settings", err="Príliš široký prefix – povolil by všetky príspevky. Použi autora.")
+            db("INSERT INTO allowed_targets(kind,value) VALUES (%s,%s)", (kind, v))
+            return back("/settings", msg="Pridané do allowlistu.")
+
+
+        @app.post("/settings/black/add")
+        def black_add(kind: str = Form(...), value: str = Form(...)):
+            if kind not in ("word", "post_url") or not value.strip(): return back("/settings", err="Neplatný záznam")
+            db("INSERT INTO blacklist(kind,value) VALUES (%s,%s)", (kind, value.strip()))
+            return back("/settings", msg="Pridané do blacklistu.")
+
+
+        @app.post("/settings/{table}/{rid}/delete")
+        def setting_delete(table: str, rid: int):
+            if table == "allow": db("DELETE FROM allowed_targets WHERE id=%s", (rid,))
+            elif table == "black": db("DELETE FROM blacklist WHERE id=%s", (rid,))
+            return back("/settings", msg="Odstránené.")
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/llm.py
+        """Jednotné rozhranie na AI modely: Anthropic (Claude) a ľubovoľné OpenAI-kompatibilné API
+        (OpenAI, OpenRouter, ale aj lokálne: Ollama, LM Studio, vLLM, llama.cpp server)."""
+        import json, re, time
+        import requests
+
+        PROVIDERS = ("anthropic", "openai_compat")
+        DEFAULTS = {"ai_provider": "anthropic", "ai_base_url": "", "ai_model": "claude-sonnet-5-5", "ai_api_key": "",
+                    "ai_temperature": "", "ai_max_tokens": "2000", "ai_timeout_s": "180", "ai_json_mode": "1"}
+
+
+        class LLMError(Exception):
+            pass
+
+
+        def _post(url, headers, body, timeout):
+            try:
+                r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            except requests.RequestException as e:
+                raise LLMError(f"spojenie zlyhalo: {e}")
+            return r
+
+
+        def chat(cfg, system, user):
+            """Vráti (text, trvanie_s). Pri chybe vyhodí LLMError."""
+            provider, model = cfg["ai_provider"], cfg["ai_model"].strip()
+            if provider not in PROVIDERS: raise LLMError("neznámy provider")
+            if not model: raise LLMError("model nie je zadaný")
+            timeout = float(cfg.get("ai_timeout_s") or 180)
+            max_tokens = int(cfg.get("ai_max_tokens") or 2000)
+            temp = cfg.get("ai_temperature", "").strip()
+            t0 = time.time()
+            if provider == "anthropic":
+                base = (cfg["ai_base_url"].strip() or "https://api.anthropic.com").rstrip("/")
+                if not cfg["ai_api_key"]: raise LLMError("chýba API kľúč pre Anthropic")
+                body = {"model": model, "max_tokens": max_tokens, "system": system, "messages": [{"role": "user", "content": user}]}
+                if temp: body["temperature"] = float(temp)
+                r = _post(base + "/v1/messages", {"x-api-key": cfg["ai_api_key"], "anthropic-version": "2023-06-01"}, body, timeout)
+                if r.status_code >= 400: raise LLMError(f"HTTP {r.status_code}: {r.text[:300]}")
+                text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
+            else:
+                base = cfg["ai_base_url"].strip().rstrip("/")
+                if not base.startswith("http"): raise LLMError("chýba base URL (napr. http://ollama:11434/v1)")
+                headers = {"Authorization": "Bearer " + cfg["ai_api_key"]} if cfg["ai_api_key"] else {}
+                body = {"model": model, "max_tokens": max_tokens, "stream": False,
+                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+                if temp: body["temperature"] = float(temp)
+                json_mode = cfg.get("ai_json_mode") == "1"
+                if json_mode: body["response_format"] = {"type": "json_object"}
+                r = _post(base + "/chat/completions", headers, body, timeout)
+                if r.status_code == 400 and json_mode:        # niektoré servery JSON režim nepodporujú
+                    body.pop("response_format"); r = _post(base + "/chat/completions", headers, body, timeout)
+                if r.status_code >= 400: raise LLMError(f"HTTP {r.status_code}: {r.text[:300]}")
+                try:
+                    text = r.json()["choices"][0]["message"]["content"] or ""
+                except Exception:
+                    raise LLMError(f"neočakávaná odpoveď: {r.text[:300]}")
+            return text, time.time() - t0
+
+
+        def extract_json(text):
+            """Vytiahne prvý JSON objekt z odpovede (znáša ```json bloky a úvodný text)."""
+            t = re.sub(r"^```(?:json)?|```$$", "", text.strip(), flags=re.M).strip()
+            a, b = t.find("{"), t.rfind("}")
+            if a < 0 or b <= a: raise ValueError("odpoveď neobsahuje JSON objekt")
+            return json.loads(t[a:b + 1])
+
+
+        def list_models(cfg):
+            """Zoznam modelov z OpenAI-kompatibilného servera (Ollama: /v1/models). Pri chybe prázdny."""
+            if cfg["ai_provider"] != "openai_compat" or not cfg["ai_base_url"].startswith("http"): return []
+            try:
+                headers = {"Authorization": "Bearer " + cfg["ai_api_key"]} if cfg["ai_api_key"] else {}
+                r = requests.get(cfg["ai_base_url"].rstrip("/") + "/models", headers=headers, timeout=2.5)
+                return sorted(m["id"] for m in r.json().get("data", []))[:200]
+            except Exception:
+                return []
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/account.html
+        {% extends "base.html" %}{% block body %}
+        <div class="card"><h2>Účet {{ a.ig_username }}</h2>
+        <form method="post" action="/accounts/{{ a.id }}/edit">
+        <div class="grid">
+        <div><label>Denný limit lajkov</label><input type="number" name="daily_like_limit" min="0" max="500" value="{{ a.daily_like_limit }}"></div>
+        <div><label>Denný limit komentárov</label><input type="number" name="daily_comment_limit" min="0" max="200" value="{{ a.daily_comment_limit }}"></div>
+        <div><label>Max akcií za hodinu</label><input type="number" name="hourly_action_limit" min="1" max="100" value="{{ a.hourly_action_limit }}"></div>
+        <div><label>Aktívny od</label><input type="time" name="active_from" value="{{ a.active_from.strftime('%H:%M') }}"></div>
+        <div><label>Aktívny do (v ten istý deň)</label><input type="time" name="active_to" value="{{ a.active_to.strftime('%H:%M') }}"></div>
+        <div><label>Časová zóna</label><input name="tz" value="{{ a.tz }}"></div>
+        <div><label>Pauza medzi akciami min (s)</label><input type="number" step="0.5" name="pause_min_s" value="{{ a.pause_min_s }}"></div>
+        <div><label>Pauza max (s)</label><input type="number" step="0.5" name="pause_max_s" value="{{ a.pause_max_s }}"></div></div>
+        <h2 style="margin-top:16px">Pripojenie (VPN)</h2>
+        {% if a.managed_locally %}
+        <div class="grid">
+        <div><label>Režim</label><select name="vpn_mode"><option value="nordvpn" {{ 'selected' if a.vpn_mode=='nordvpn' }}>NordVPN</option><option value="none" {{ 'selected' if a.vpn_mode=='none' }}>bez VPN (IP servera)</option></select></div>
+        <div><label>Krajina</label><input name="vpn_country" value="{{ a.vpn_country }}"></div>
+        <div><label>Mesto (voliteľné)</label><input name="vpn_city" value="{{ a.vpn_city }}"></div>
+        <div><label>Pevný server (voliteľné, napr. sk123.nordvpn.com)</label><input name="vpn_hostname" value="{{ a.vpn_hostname }}"></div></div>
+        <p><small>Výstupná IP: <b>{{ a.exit_ip or 'zatiaľ nezistená' }}</b>. Bez pevného servera si gluetun vyberie server zo zvolenej krajiny/mesta a pri novom pripojení môže zvoliť iný (IP sa zmení). Pevný server dáva stabilnú IP, ale ak ho NordVPN vyradí, VPN sa nepripojí, kým ho nezmeníš.{% if not has_key %} <span class="bad">NordVPN kľúč nie je nastavený (menu VPN).</span>{% endif %}</small></p>
+        {% else %}<p class="mut">Tento účet beží na samostatnom serveri; VPN sa nastavuje tam (docker-compose.worker.yml).</p>{% endif %}
+        <p><button class="p">Uložiť</button> <a class="btn" href="/">Späť</a></p></form></div>
+        <div class="card"><h2>Odstrániť účet</h2><form method="post" action="/accounts/{{ a.id }}/delete">
+        <label style="display:inline"><input type="checkbox" name="confirm" style="width:auto" required> Rozumiem, worker sa zastaví a čakajúce úlohy sa zrušia (história ostane).</label>
+        <p><button class="d">Odstrániť</button></p></form></div>
+        {% endblock %}
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/ai.html
+        {% extends "base.html" %}{% set nav='ai' %}{% block body %}
+        <div class="card"><h2>AI model šéf-agenta</h2>
+        <p><small>Model premení tvoj príkaz na úlohy. Bezpečnostné pravidlá (limity, allowlist, blacklist, účty, schvaľovanie komentárov) sa kontrolujú v kóde, nie v modeli, takže slabší model nemôže obísť ochrany. Modelu sa posiela: príkaz, mená aktívnych účtov so zostávajúcimi limitmi, allowlist/blacklist a posledné texty komentárov. Pri lokálnom modeli neodchádza nič mimo tvoj server.</small></p>
+        <p>Rýchle predvoľby:
+        <button type="button" class="btn" onclick="preset('anthropic','','claude-sonnet-5-5')">Claude (Anthropic)</button>
+        <button type="button" class="btn" onclick="preset('openai_compat','https://api.openai.com/v1','')">OpenAI</button>
+        <button type="button" class="btn" onclick="preset('openai_compat','https://openrouter.ai/api/v1','')">OpenRouter</button>
+        <button type="button" class="btn" onclick="preset('openai_compat','http://ollama:11434/v1','')">Lokálny – Ollama (v tomto compose)</button>
+        <button type="button" class="btn" onclick="preset('openai_compat','http://host.docker.internal:11434/v1','')">Lokálny – Ollama na hostiteľovi</button>
+        <button type="button" class="btn" onclick="preset('openai_compat','http://host.docker.internal:1234/v1','')">Lokálny – LM Studio</button></p>
+        <form method="post" action="/settings/ai/save">
+        <div class="grid">
+        <div><label>Provider</label><select name="provider" id="provider"><option value="anthropic" {{ 'selected' if cfg.ai_provider=='anthropic' }}>Anthropic (Claude API)</option><option value="openai_compat" {{ 'selected' if cfg.ai_provider=='openai_compat' }}>OpenAI-kompatibilné API (OpenAI, OpenRouter, Ollama, LM Studio, vLLM, llama.cpp …)</option></select></div>
+        <div><label>Base URL (pri Claude nechaj prázdne)</label><input name="base_url" id="base_url" value="{{ cfg.ai_base_url }}" placeholder="http://ollama:11434/v1"></div>
+        <div><label>Model</label><input name="model" id="model" list="mlist" value="{{ cfg.ai_model }}" required>
+        <datalist id="mlist">{% for m in models %}<option value="{{ m }}">{% endfor %}<option value="claude-sonnet-5-5"><option value="claude-opus-5-5"><option value="claude-haiku-5-5"></datalist>
+        <small>{% if models %}Načítané zo servera: {{ models|length }} modelov (začni písať).{% else %}Lokálne napr. qwen2.5:7b-instruct alebo llama3.1:8b (musí byť stiahnutý).{% endif %}</small></div>
+        <div><label>API kľúč {% if has_key %}(uložený – prázdne = ponechať){% else %}(pri lokálnom modeli netreba){% endif %}</label><input name="api_key" type="password" autocomplete="new-password">
+        {% if has_key %}<label style="display:inline"><input type="checkbox" name="clear_key" value="1" style="width:auto"> zmazať uložený kľúč</label>{% endif %}</div>
+        <div><label>Teplota (prázdne = predvolená)</label><input name="temperature" value="{{ cfg.ai_temperature }}" placeholder="0.4"></div>
+        <div><label>Max. tokenov odpovede</label><input type="number" name="max_tokens" value="{{ cfg.ai_max_tokens }}"></div>
+        <div><label>Timeout (s) – lokálne modely bývajú pomalé</label><input type="number" name="timeout_s" value="{{ cfg.ai_timeout_s }}"></div></div>
+        <p><label style="display:inline"><input type="checkbox" name="json_mode" value="1" style="width:auto" {{ 'checked' if cfg.ai_json_mode=='1' }}> vynútiť JSON režim (OpenAI-kompatibilné servery; vypni, ak server hlási chybu)</label></p>
+        <details {{ 'open' if custom_prompt }}><summary><b>Prompt šéf-agenta</b> {% if custom_prompt %}<span class="tag warn">upravený</span>{% else %}<small>(predvolený)</small>{% endif %}</summary>
+        <p><small>Úprava je určená na doladenie slabších modelov. Pravidlá v kóde platia nezávisle od textu promptu. Výstup musí zostať JSON podľa predlohy.</small></p>
+        <textarea name="prompt" rows="16" style="font-family:monospace;font-size:13px">{{ prompt }}</textarea></details>
+        <p style="margin-top:12px"><button class="p">Uložiť</button>
+        <button formaction="/settings/ai/test" formnovalidate>Otestovať spojenie (bez uloženia)</button></p></form></div>
+        <script>
+        function preset(p,u,m){document.getElementById('provider').value=p;document.getElementById('base_url').value=u;if(m)document.getElementById('model').value=m;}
+        </script>
+        {% endblock %}
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/base.html
+        <!doctype html>
+        <html lang="sk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>IG Brand Agents</title>
+        {% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
+        <style>
+        :root{--bg:#f6f7f9;--card:#fff;--tx:#1b1f24;--mut:#6b7280;--bd:#e3e6ea;--ac:#2f5bea;--ok:#0f8a4f;--warn:#b7791f;--bad:#c53030}
+        @media(prefers-color-scheme:dark){:root{--bg:#14161a;--card:#1d2026;--tx:#e8eaed;--mut:#9aa1ab;--bd:#2c3038;--ac:#6f93ff;--ok:#41c27f;--warn:#e0a94a;--bad:#f06a6a}}
+        *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,sans-serif}
+        header{background:var(--card);border-bottom:1px solid var(--bd);padding:0 16px;display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+        header b{padding:14px 0}header a{color:var(--mut);text-decoration:none;padding:14px 0}header a.on,header a:hover{color:var(--tx)}
+        main{max-width:1180px;margin:0 auto;padding:16px}
+        .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 16px;margin-bottom:16px}
+        h2{margin:0 0 10px;font-size:16px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--bd);vertical-align:top}
+        th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase}
+        .tablewrap{overflow-x:auto}
+        button,.btn{font:inherit;padding:5px 10px;border:1px solid var(--bd);background:var(--card);color:var(--tx);border-radius:7px;cursor:pointer;text-decoration:none;display:inline-block}
+        button.p{background:var(--ac);border-color:var(--ac);color:#fff}button.d{color:var(--bad)}
+        input,select,textarea{font:inherit;padding:6px 8px;border:1px solid var(--bd);border-radius:7px;background:var(--bg);color:var(--tx);width:100%}
+        form.inline{display:inline}label{display:block;color:var(--mut);font-size:12px;margin:8px 0 3px}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+        .tag{padding:2px 8px;border-radius:99px;font-size:12px;border:1px solid var(--bd)}
+        .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+        .flash{padding:10px 14px;border-radius:8px;margin-bottom:14px}.flash.m{background:rgba(15,138,79,.12);color:var(--ok)}.flash.e{background:rgba(197,48,48,.12);color:var(--bad)}
+        .stats{display:flex;gap:26px;flex-wrap:wrap}.stats div b{display:block;font-size:24px}
+        small{color:var(--mut)}details summary{cursor:pointer}
+        </style></head><body>
+        <header><b>IG Brand Agents</b>
+        <a href="/" class="{{ 'on' if nav=='dash' }}">Prehľad</a><a href="/tasks" class="{{ 'on' if nav=='tasks' }}">Úlohy</a>
+        <a href="/logs" class="{{ 'on' if nav=='logs' }}">Logy</a><a href="/settings" class="{{ 'on' if nav=='set' }}">Nastavenia</a><a href="/settings/ai" class="{{ 'on' if nav=='ai' }}">AI model</a><a href="/settings/vpn" class="{{ 'on' if nav=='vpn' }}">VPN</a></header>
+        <main>
+        {% if msg %}<div class="flash m">{{ msg }}</div>{% endif %}{% if err %}<div class="flash e">{{ err }}</div>{% endif %}
+        {% if not docker_ok %}<div class="flash e">Docker nie je dostupný – správa workerov je vypnutá.</div>{% endif %}
+        {% block body %}{% endblock %}
+        </main></body></html>
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/dashboard.html
+        {% extends "base.html" %}{% set nav='dash' %}{% set refresh=20 %}
+        {% block body %}
+        <div class="card"><div class="stats">
+        <div><b>{{ stats.done }}</b><small>hotové dnes</small></div><div><b>{{ stats.failed }}</b><small>zlyhané dnes</small></div>
+        <div><b>{{ stats.queued }}</b><small>vo fronte</small></div><div><b>{{ pending|length }}</b><small>čaká na schválenie</small></div>
+        <div><b>{{ n_workers }}</b><small>bežiace workery</small></div>
+        {% if mem_total %}<div><b>{{ mem_avail }} / {{ mem_total }} GB</b><small>RAM voľná / celková (cca 1 GB na účet)</small></div>{% endif %}
+        </div></div>
+
+        {% if pending %}<div class="card"><h2>Komentáre na schválenie</h2><div class="tablewrap"><table>
+        <tr><th>#</th><th>Účet</th><th>Príspevok</th><th>Text komentára</th><th></th></tr>
+        {% for p in pending %}<tr><td>{{ p.id }}</td><td>{{ p.ig_username }}</td><td><a href="{{ p.post_url }}" target="_blank" rel="noopener">odkaz</a><br><small>{{ p.post_context or '' }}</small></td>
+        <td>{{ p.comment_text }}</td><td style="white-space:nowrap">
+        <form class="inline" method="post" action="/tasks/{{ p.id }}/approve"><input type="hidden" name="next" value="/"><button class="p">Schváliť</button></form>
+        <form class="inline" method="post" action="/tasks/{{ p.id }}/reject"><input type="hidden" name="next" value="/"><button class="d">Zamietnuť</button></form></td></tr>{% endfor %}
+        </table></div></div>{% endif %}
+
+        <div class="card"><h2>Príkaz pre šéf-agenta</h2>
+        <form method="post" action="/agent"><textarea name="command" rows="2" required placeholder="napr. Daj like na https://www.instagram.com/p/XXXX/ z účtu {{ accounts[0].ig_username if accounts else 'meno_uctu' }}. Popis príspevku: …"></textarea>
+        <p><button class="p">Odoslať agentovi</button> <small>Model: <a href="/settings/ai">{{ ai_model }}</a>. Komentáre čakajú na tvoje schválenie. Lokálne modely môžu odpovedať aj minútu.</small></p></form></div>
+
+        <div class="card"><h2>Účty</h2><div class="tablewrap"><table>
+        <tr><th>Účet</th><th>Stav</th><th>Worker</th><th>VPN / IP</th><th>Dnes (👍 / 💬)</th><th>Režim</th><th>Naposledy</th><th>Akcie</th></tr>
+        {% for a in accounts %}{% set st = states.get(a.ig_username) %}<tr>
+        <td><b><a href="/accounts/{{ a.id }}">{{ a.ig_username }}</a></b>{% if a.risk_reason %}<br><small class="bad">{{ a.risk_reason }}</small>{% endif %}</td>
+        <td><span class="tag {{ 'ok' if a.status=='active' else ('bad' if a.status=='risk' else 'warn') }}">{{ a.status }}</span>{% if not a.brand_disclosed %}<br><small class="warn">nepotvrdený ako značkový</small>{% endif %}</td>
+        <td>{% if not a.managed_locally %}<small>externý</small>{% elif st %}<span class="{{ 'ok' if st.startswith('running') else 'bad' }}">{{ st }}</span>{% else %}<span class="mut">nebeží</span>{% endif %}</td>
+        <td>{% if a.vpn_mode == 'nordvpn' %}NordVPN · {{ a.vpn_country }}{% if a.vpn_city %}/{{ a.vpn_city }}{% endif %}<br><small>{{ a.exit_ip or '–' }} · {{ vstates.get(a.ig_username, 'nebeží') }}</small>{% else %}<span class="warn">bez VPN</span><br><small>IP servera</small>{% endif %}</td>
+        <td>{{ a.likes_today }}/{{ a.daily_like_limit }} · {{ a.comments_today }}/{{ a.daily_comment_limit }}</td>
+        <td>{% if a.dry_run %}<span class="tag warn">dry-run</span>{% else %}<span class="tag ok">naostro</span>{% endif %}</td>
+        <td>{{ a.seen_s or '–' }}{% if a.seen_age > 300 and a.status=='active' %} <span class="bad">⚠</span>{% endif %}</td>
+        <td style="white-space:nowrap">
+        {% if a.managed_locally %}<form class="inline" method="post" action="/accounts/{{ a.id }}/login"><button>Prihlásiť</button></form>
+        {% if st and st.startswith('running') %}<form class="inline" method="post" action="/accounts/{{ a.id }}/worker/stop"><button>Stop</button></form>
+        {% else %}<form class="inline" method="post" action="/accounts/{{ a.id }}/worker/start"><button>Štart</button></form>{% endif %}{% endif %}
+        {% if a.status!='active' and a.status!='risk' %}<form class="inline" method="post" action="/accounts/{{ a.id }}/status/activate"><label style="display:inline"><input type="checkbox" name="confirm" style="width:auto" required title="Účet je zjavne značkový a patrí nám"> značkový</label> <button class="p">Aktivovať</button></form>{% endif %}
+        {% if a.status=='active' %}<form class="inline" method="post" action="/accounts/{{ a.id }}/status/pause"><button>Pauza</button></form>{% endif %}
+        {% if a.status=='risk' %}<form class="inline" method="post" action="/accounts/{{ a.id }}/status/unblock"><button class="p">Odblokovať</button></form>{% endif %}
+        {% if a.dry_run %}<form class="inline" method="post" action="/accounts/{{ a.id }}/status/golive"><label style="display:inline"><input type="checkbox" name="confirm" style="width:auto" required> reálne</label> <button>Naostro</button></form>
+        {% else %}<form class="inline" method="post" action="/accounts/{{ a.id }}/status/dryrun"><button>Späť na dry-run</button></form>{% endif %}
+        </td></tr>{% else %}<tr><td colspan="8" class="mut">Zatiaľ žiadny účet. Pridaj prvý nižšie.</td></tr>{% endfor %}
+        </table></div></div>
+
+        <div class="card"><details {{ 'open' if not accounts }}><summary><b>+ Pridať účet</b></summary>
+        <form method="post" action="/accounts/add"><div class="grid">
+        <div><label>Používateľské meno na Instagrame</label><input name="username" required pattern="[A-Za-z0-9._]{1,30}"></div>
+        <div><label>Pripojenie</label><select name="vpn_mode"><option value="nordvpn">NordVPN (odporúčané)</option><option value="none">bez VPN (IP servera)</option></select></div>
+        <div><label>NordVPN krajina (napr. Slovakia)</label><input name="vpn_country" value="{{ default_country }}" placeholder="Slovakia"></div>
+        <div><label>Mesto (voliteľné)</label><input name="vpn_city" value="{{ default_city }}"></div></div>
+        <p><label style="display:inline"><input type="checkbox" name="start" value="1" style="width:auto" checked> hneď spustiť worker (kontajner) na tomto serveri</label><br>
+        <label style="display:inline"><input type="checkbox" name="external" value="1" style="width:auto"> worker pobeží na samostatnom VPS (docker-compose.worker.yml) – rozhranie ho len sleduje</label></p>
+        <button class="p">Pridať účet</button> <small>Po pridaní klikni Prihlásiť, potom Aktivovať. Nový účet beží v dry-run, nič neodosiela.</small></form></details></div>
+        {% endblock %}
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/login.html
+        {% extends "base.html" %}{% block body %}
+        <div class="card"><h2>Prihlásenie účtu {{ a.ig_username }}</h2>
+        {% if state == 'running' %}
+        <p>Otvorí sa prehliadač tohto účtu (cez NordVPN účtu, ak je zapnutý). Prihlás sa na Instagram vrátane 2FA a odklikni cookie okno či ponuku „Uložiť prihlásenie“. Vloženie textu: panel schránky v noVNC (ľavý okraj). Potom sa vráť sem a klikni „Hotovo“. Nezatváraj to skôr a po kliknutí počkaj niekoľko sekúnd, kým sa profil uloží.</p>
+        <p><a class="btn p" style="color:#fff" href="/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify" target="_blank" rel="noopener">Otvoriť prehliadač účtu</a></p>
+        {% elif state == 'none' or state is none %}<p class="warn">Prihlasovacia relácia nebeží. Spusti ju z prehľadu tlačidlom „Prihlásiť“.</p>
+        {% else %}<p>Relácia sa ukončila (stav: {{ state }}). Klikni „Hotovo“.</p>{% endif %}
+        <form method="post" action="/accounts/{{ a.id }}/login/done"><button class="p">Hotovo – spustiť worker</button> <a class="btn" href="/">Zrušiť</a></form></div>
+        {% endblock %}
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/logs.html
+        {% extends "base.html" %}{% set nav='logs' %}{% set refresh=30 %}{% block body %}
+        <div class="card"><h2>Posledné udalosti</h2><div class="tablewrap"><table><tr><th>Čas</th><th>Účet</th><th>Úloha</th><th>Udalosť</th><th>Chyba</th><th>Screenshot</th></tr>
+        {% for r in rows %}<tr><td>{{ r.t }}</td><td>{{ r.ig_username or '' }}</td><td>{{ r.task_id or '' }}</td>
+        <td class="{{ 'bad' if r.event in ('risk','failed','ambiguous') else ('ok' if r.event=='done' else '') }}">{{ r.event }}</td><td><small>{{ r.error }}</small></td>
+        <td>{% if r.shot and r.ig_username %}<a href="/shots/{{ r.ig_username }}/{{ r.shot }}" target="_blank">zobraziť</a>{% endif %}</td></tr>
+        {% else %}<tr><td colspan="6" class="mut">Zatiaľ nič.</td></tr>{% endfor %}</table></div></div>{% endblock %}
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/settings.html
+        {% extends "base.html" %}{% set nav='set' %}{% block body %}
+        <div class="card"><h2>Allowlist – pod čími príspevkami smú účty konať</h2>
+        <p><small>Autor sa zisťuje zo stránky príspevku. Ak ho worker nezistí alebo nie je v zozname, úloha sa zamietne.</small></p>
+        <table>{% for r in allow %}<tr><td>{{ r.kind }}</td><td>{{ r.value }}</td><td><form method="post" action="/settings/allow/{{ r.id }}/delete"><button class="d">Odstrániť</button></form></td></tr>
+        {% else %}<tr><td class="bad">Allowlist je prázdny – žiadna akcia sa nevykoná.</td></tr>{% endfor %}</table>
+        <form method="post" action="/settings/allow/add" class="grid" style="margin-top:10px"><div><label>Typ</label><select name="kind"><option value="author">autor (IG meno)</option><option value="url_prefix">URL prefix</option></select></div>
+        <div><label>Hodnota</label><input name="value" required></div><div style="align-self:end"><button class="p">Pridať</button></div></form></div>
+        <div class="card"><h2>Blacklist</h2><table>{% for r in black %}<tr><td>{{ r.kind }}</td><td>{{ r.value }}</td><td><form method="post" action="/settings/black/{{ r.id }}/delete"><button class="d">Odstrániť</button></form></td></tr>
+        {% else %}<tr><td class="mut">Prázdny.</td></tr>{% endfor %}</table>
+        <form method="post" action="/settings/black/add" class="grid" style="margin-top:10px"><div><label>Typ</label><select name="kind"><option value="word">slovo v komentári</option><option value="post_url">URL príspevku</option></select></div>
+        <div><label>Hodnota</label><input name="value" required></div><div style="align-self:end"><button class="p">Pridať</button></div></form></div>
+        {% endblock %}
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/tasks.html
+        {% extends "base.html" %}{% set nav='tasks' %}{% set refresh=30 %}{% block body %}
+        <div class="card"><details><summary><b>+ Nová úloha ručne</b></summary>
+        <form method="post" action="/tasks/new"><div class="grid">
+        <div><label>Účet</label><select name="account_id">{% for a in accounts %}<option value="{{ a.id }}">{{ a.ig_username }}</option>{% endfor %}</select></div>
+        <div><label>Akcia</label><select name="action"><option value="like">like</option><option value="comment">comment</option></select></div>
+        <div style="grid-column:1/-1"><label>URL príspevku</label><input name="post_url" required placeholder="https://www.instagram.com/p/…"></div>
+        <div style="grid-column:1/-1"><label>Text komentára (len pri comment; musí byť unikátny)</label><textarea name="comment_text" rows="2"></textarea></div>
+        <div style="grid-column:1/-1"><label>Poznámka k príspevku (voliteľné)</label><input name="post_context"></div></div>
+        <p><button class="p">Vytvoriť</button> <small>Komentár pôjde najprv na schválenie.</small></p></form></details></div>
+        <div class="card"><h2>Úlohy</h2>
+        <p>{% for s in ['', 'pending','awaiting_approval','in_progress','done','failed','cancelled'] %}<a class="btn" href="/tasks?status={{ s }}" style="{{ 'font-weight:700' if s==status }}">{{ s or 'všetky' }}</a> {% endfor %}</p>
+        <div class="tablewrap"><table><tr><th>#</th><th>Účet</th><th>Akcia</th><th>Príspevok / text</th><th>Stav</th><th>Výsledok</th><th>Vytvorené</th><th></th></tr>
+        {% for r in rows %}<tr><td>{{ r.id }}</td><td>{{ r.ig_username }}</td><td>{{ r.action }}</td>
+        <td><a href="{{ r.post_url }}" target="_blank" rel="noopener">odkaz</a>{% if r.comment_text %}<br><small>{{ r.comment_text }}</small>{% endif %}</td>
+        <td>{{ r.status }}{% if r.attempts %} <small>({{ r.attempts }}×)</small>{% endif %}</td><td><small>{{ r.result }}</small></td><td><small>{{ r.created }}</small></td>
+        <td style="white-space:nowrap">{% if r.status=='awaiting_approval' %}<form class="inline" method="post" action="/tasks/{{ r.id }}/approve"><input type="hidden" name="next" value="/tasks"><button class="p">Schváliť</button></form>{% endif %}
+        {% if r.status in ('awaiting_approval','pending') %}<form class="inline" method="post" action="/tasks/{{ r.id }}/cancel"><input type="hidden" name="next" value="/tasks"><button class="d">Zrušiť</button></form>{% endif %}</td></tr>
+        {% else %}<tr><td colspan="8" class="mut">Žiadne úlohy.</td></tr>{% endfor %}</table></div></div>{% endblock %}
+        __IG_EOF__
+        COPY <<"__IG_EOF__" /app/templates/vpn.html
+        {% extends "base.html" %}{% set nav='vpn' %}{% block body %}
+        <div class="card"><h2>NordVPN</h2>
+        <p><small>Každý účet má vlastný VPN kontajner (gluetun, WireGuard/NordLynx) a worker ide výhradne cez neho. Ak VPN spadne, worker nemá spojenie, nikdy nejde z IP servera. Pre všetky účty sa používa jeden NordLynx kľúč tvojho NordVPN účtu.</small></p>
+        <p>Stav kľúča: {% if has_key %}<span class="tag ok">uložený</span>{% else %}<span class="tag bad">chýba</span>{% endif %}</p>
+        <form method="post" action="/settings/vpn/save"><div class="grid">
+        <div><label>Možnosť A: NordVPN access token (z neho sa získa kľúč; token sa neukladá)</label><input name="access_token" type="password" autocomplete="off"></div>
+        <div><label>Možnosť B: priamo NordLynx / WireGuard privátny kľúč</label><input name="private_key" type="password" autocomplete="off"></div></div>
+        <p><button class="p">Uložiť kľúč</button>
+        {% if has_key %}<button name="clear_key" value="1" class="d" formnovalidate>Zmazať kľúč</button>{% endif %}</p></form></div>
+        <div class="card"><h2>Otestovať pripojenie</h2>
+        <form method="post" action="/settings/vpn/test" class="grid"><div><label>Krajina</label><input name="country" value="{{ countries.split(',')[0] if countries else 'Slovakia' }}" required></div>
+        <div><label>Mesto (voliteľné)</label><input name="city" value="{{ cities.split(',')[0] if cities else '' }}"></div>
+        <div style="align-self:end"><button>Spustiť test (do 2,5 min)</button></div></form>
+        <p><small>Spustí dočasný VPN kontajner, zistí výstupnú IP a odstráni ho.</small></p></div>
+        <div class="card"><h2>VPN účtov</h2><table><tr><th>Účet</th><th>Krajina / mesto</th><th>Server</th><th>Výstupná IP</th><th>Kontajner</th></tr>
+        {% for a in accounts %}<tr><td>{{ a.ig_username }}</td><td>{{ a.vpn_country }}{% if a.vpn_city %} / {{ a.vpn_city }}{% endif %}</td><td>{{ a.vpn_hostname or 'podľa výberu' }}</td><td>{{ a.exit_ip or '–' }}</td><td>{{ vstates.get(a.ig_username, 'nebeží') }}</td></tr>
+        {% else %}<tr><td colspan="5" class="mut">Žiadny účet nepoužíva NordVPN.</td></tr>{% endfor %}</table>
+        <p><small>Obmedzenia: NordVPN povoľuje obmedzený počet súčasných pripojení na účet (každý beziaci účet = jedno pripojenie; over aktuálny limit u NordVPN). Výstupné IP NordVPN sú zdieľané s ďalšími zákazníkmi a pochádzajú z dátových centier; Instagram ich môže posudzovať prísnejšie. Server musí mať zariadenie /dev/net/tun (bežné KVM VPS áno; niektoré kontajnerové VPS nie).</small></p></div>
+        {% endblock %}
+        __IG_EOF__
+        EXPOSE 8000
+        CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql://igagents:${POSTGRES_PASSWORD:?nastav POSTGRES_PASSWORD}@postgres:5432/igagents
+      WORKER_DATABASE_URL: postgresql://ig_worker:${WORKER_DB_PASSWORD:?nastav WORKER_DB_PASSWORD}@postgres:5432/igagents
+      N8N_URL: http://n8n:5678
+      COMMAND_KEY: ${COMMAND_KEY:?nastav COMMAND_KEY}
+      HOST_DATA_DIR: ${DATA_DIR:?nastav DATA_DIR (absolútna cesta)}
+      WORKER_IMAGE: ig-worker:1.1.0
+      NETWORK: ig_net
+      IG_LOCALE: ${IG_LOCALE:-en-US}
+      TZ: ${TZ:-Europe/Bratislava}
+      SEL_LIKE: ${SEL_LIKE:-}
+      SEL_UNLIKE: ${SEL_UNLIKE:-}
+      SEL_COMMENT: ${SEL_COMMENT:-}
+      POST_LABEL: ${POST_LABEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NORDVPN_PRIVATE_KEY: ${NORDVPN_PRIVATE_KEY:-}
+      VPN_COUNTRIES: ${VPN_COUNTRIES:-}
+      VPN_CITIES: ${VPN_CITIES:-}
+      VPN_IMAGE: qmcgaw/gluetun:${VPN_TAG:-v3}
+      ALLOWED_AUTHORS: ${ALLOWED_AUTHORS:-}
+      ALLOWED_URL_PREFIXES: ${ALLOWED_URL_PREFIXES:-}
+      BLACKLIST_WORDS: ${BLACKLIST_WORDS:-}
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DATA_DIR:?nastav DATA_DIR}:/data-root
+    configs:
+      - source: boss_prompt
+        target: /prompts/boss_agent.md
+    depends_on:
+      postgres: {condition: service_healthy}
+      worker-build: {condition: service_completed_successfully}
+
+  # ---- HTTPS + heslo (Caddyfile sa vygeneruje pri štarte z DOMAIN a ADMIN_PASSWORD) ----
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN:?nastav DOMAIN}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?nastav ADMIN_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        HASH="$$(caddy hash-password --plaintext "$$ADMIN_PASSWORD")"
+        cat > /etc/caddy/Caddyfile <<EOF
+        $$DOMAIN {
+            @hooks path /webhook/* /webhook-test/*
+            handle @hooks {
+                reverse_proxy n8n:5678
+            }
+            handle {
+                basic_auth {
+                    admin $$HASH
+                }
+                handle_path /novnc/* {
+                    reverse_proxy ig-login:6080
+                }
+                handle {
+                    reverse_proxy manager:8000
+                }
+            }
+        }
+        EOF
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    volumes:
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on: [manager, n8n]
+
+  # ---- denná záloha DB (14 dní) a čistenie starých screenshotov (30 dní); ukladá do DATA_DIR/_backups ----
+  backup:
+    image: postgres:16
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /data-root/_backups
+        while true; do
+          F=/data-root/_backups/db_$$(date +%F).sql.gz
+          pg_dump --clean --if-exists -h postgres -U "$$POSTGRES_USER" "$$POSTGRES_DB" | gzip > "$$F" && echo "záloha OK: $$F"
+          find /data-root/_backups -name 'db_*.sql.gz' -mtime +14 -delete
+          find /data-root -name '*.png' -mtime +30 -delete
+          sleep 86400
+        done
+    environment:
+      POSTGRES_USER: igagents
+      POSTGRES_DB: igagents
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?nastav POSTGRES_PASSWORD}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?nastav POSTGRES_PASSWORD}
+    volumes:
+      - ${DATA_DIR:?nastav DATA_DIR}:/data-root
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  # ---- voliteľný lokálny model: COMPOSE_PROFILES=llm a LOCAL_LLM_MODEL=qwen2.5:7b-instruct ----
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    profiles: ["llm"]
+    volumes: [ollamadata:/root/.ollama]
+    # GPU (NVIDIA Container Toolkit): odkomentuj
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    restart: "no"
+    profiles: ["llm"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until ollama list >/dev/null 2>&1; do sleep 3; done
+        ollama pull "$$LOCAL_LLM_MODEL"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-qwen2.5:7b-instruct}
+    depends_on: [ollama]
+
+# ---- vložené súbory ----
+configs:
+  db_schema:
+    content: |
+      -- PostgreSQL schema: správa 10 značkových Instagram účtov
+      CREATE TABLE accounts (
+        id                    serial PRIMARY KEY,
+        ig_username           text UNIQUE NOT NULL,
+        status                text NOT NULL DEFAULT 'paused' CHECK (status IN ('active','paused','risk')),
+        brand_disclosed       boolean NOT NULL DEFAULT false,  -- operátor potvrdil, že účet je zjavne značkový
+        dry_run               boolean NOT NULL DEFAULT true,   -- true = worker nič neodosiela (testovací režim)
+        likes_today           int NOT NULL DEFAULT 0,
+        comments_today        int NOT NULL DEFAULT 0,
+        daily_like_limit      int NOT NULL DEFAULT 40,
+        daily_comment_limit   int NOT NULL DEFAULT 12,
+        hourly_action_limit   int NOT NULL DEFAULT 8,
+        last_action_at        timestamptz,
+        risk_reason           text,
+        archived              boolean NOT NULL DEFAULT false,
+        managed_locally       boolean NOT NULL DEFAULT true,     -- worker spúšťa GUI na tomto serveri
+        vpn_mode              text NOT NULL DEFAULT 'nordvpn' CHECK (vpn_mode IN ('nordvpn','none')),
+        vpn_country           text NOT NULL DEFAULT '',          -- NordVPN: krajina servera (napr. Slovakia)
+        vpn_city              text NOT NULL DEFAULT '',
+        vpn_hostname          text NOT NULL DEFAULT '',          -- voliteľné pripnutie konkrétneho servera (sk123.nordvpn.com)
+        exit_ip               text,                              -- posledná zistená výstupná IP účtu
+        last_seen             timestamptz,                       -- heartbeat workera
+        tz                    text NOT NULL DEFAULT 'Europe/Bratislava',
+        active_from           time NOT NULL DEFAULT '08:00',      -- časové okno, kedy smie účet konať
+        active_to             time NOT NULL DEFAULT '22:00',
+        pause_min_s           numeric NOT NULL DEFAULT 3,         -- pauza medzi akciami
+        pause_max_s           numeric NOT NULL DEFAULT 12
+      );
+
+      -- allowlist: na ktoré príspevky smú účty reagovať (kind: author | url_prefix)
+      CREATE TABLE allowed_targets (
+        id    serial PRIMARY KEY,
+        kind  text NOT NULL CHECK (kind IN ('author','url_prefix')),
+        value text NOT NULL,
+        note  text
+      );
+
+      -- blacklist (kind: word | author | post_url)
+      CREATE TABLE blacklist (
+        id    serial PRIMARY KEY,
+        kind  text NOT NULL CHECK (kind IN ('word','author','post_url')),
+        value text NOT NULL
+      );
+
+      CREATE TABLE tasks (
+        id               bigserial PRIMARY KEY,
+        account_id       int NOT NULL REFERENCES accounts(id),
+        post_url         text NOT NULL,
+        post_context     text,                       -- stručný popis príspevku od operátora (nescrapujeme)
+        action           text NOT NULL CHECK (action IN ('like','comment')),
+        comment_text     text,
+        status           text NOT NULL DEFAULT 'pending'
+                         CHECK (status IN ('pending','awaiting_approval','in_progress','done','failed','cancelled')),
+        priority         int NOT NULL DEFAULT 0,
+        attempts         int NOT NULL DEFAULT 0,
+        max_attempts     int NOT NULL DEFAULT 3,
+        requested_by     text,
+        approved_by      text,
+        approved_at      timestamptz,
+        not_before       timestamptz,
+        lease_expires_at timestamptz,
+        created_at       timestamptz NOT NULL DEFAULT now(),
+        started_at       timestamptz,
+        finished_at      timestamptz,
+        result           text,
+        CHECK (action <> 'comment' OR comment_text IS NOT NULL)
+      );
+      CREATE INDEX tasks_queue_idx ON tasks (account_id, status, priority DESC, created_at);
+      -- jeden text nesmie ísť dvakrát (kvalita, nie obchádzanie filtra)
+      CREATE UNIQUE INDEX tasks_unique_comment ON tasks (md5(lower(trim(comment_text))))
+        WHERE action = 'comment' AND status NOT IN ('failed','cancelled');
+      -- jeden účet nepridá na ten istý post dve rovnaké akcie
+      CREATE UNIQUE INDEX tasks_unique_action ON tasks (account_id, post_url, action)
+        WHERE status NOT IN ('failed','cancelled');
+
+      CREATE TABLE logs (
+        id             bigserial PRIMARY KEY,
+        task_id        bigint REFERENCES tasks(id),
+        account_id     int REFERENCES accounts(id),
+        event          text NOT NULL,       -- claimed | done | failed | risk | limit | reaped | ...
+        screenshot_url text,
+        error          text,
+        created_at     timestamptz NOT NULL DEFAULT now()
+      );
+
+
+      -- nastavenia (AI model a pod.); ig_worker k nim NEMÁ prístup
+      CREATE TABLE settings (key text PRIMARY KEY, value text NOT NULL);
+  db_roles:
+    content: |
+      #!/bin/bash
+      # Spustí sa pri prvom štarte Postgresu. Vytvorí používateľa s minimálnymi právami pre workery.
+      set -e
+      : "$${WORKER_DB_PASSWORD:?WORKER_DB_PASSWORD nie je nastavené}"
+      psql -v ON_ERROR_STOP=1 -v wpass="$$WORKER_DB_PASSWORD" --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" <<'SQL'
+      CREATE ROLE ig_worker LOGIN PASSWORD :'wpass';
+      GRANT CONNECT ON DATABASE :"DBNAME" TO ig_worker;
+      GRANT USAGE ON SCHEMA public TO ig_worker;
+      GRANT SELECT ON accounts, allowed_targets, blacklist TO ig_worker;
+      GRANT UPDATE (likes_today, comments_today, last_action_at, status, risk_reason, last_seen) ON accounts TO ig_worker;
+      GRANT SELECT, UPDATE ON tasks TO ig_worker;
+      GRANT INSERT ON logs TO ig_worker;
+      GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ig_worker;
+      SQL
+  boss_prompt:
+    content: |
+      # Systémový prompt – šéf-agent
+
+      Si šéf-agent pre správu 10 zjavne značkových Instagram účtov. Prijímaš príkazy od ľudského operátora a vytváraš bezpečné, limitované úlohy (`like`, `comment`) pre workery. Žiadne iné akcie neexistujú.
+
+      ## Vstup, ktorý dostaneš
+      - príkaz operátora (post_url, voliteľne `post_context` = stručný popis príspevku od operátora, účet, tón)
+      - stav účtov: status, brand_disclosed, likes_today, comments_today, limity
+      - allowlist a blacklist
+      - posledné komentáre (na kontrolu opakovania)
+
+      ## Pravidlá
+      1. Úlohy vytváraj len pre účty so `status='active'` a `brand_disclosed=true`.
+      2. Neprekroč denné limity (40 likeov / 12 komentárov) ani zvyšok limitu účtu. Ak operátor žiada riskantné množstvo naraz, upozorni ho a zníž počet.
+      3. post_url nesmie byť na blackliste. Ak operátor uvedie autora príspevku a ten nie je v allowliste, úlohu nevytváraj a vysvetli prečo. Autora z URL nehádaj: allowlist definitívne overí worker po otvorení príspevku.
+      4. Priraďuj round-robin, pokiaľ operátor nešpecifikuje účet. Jeden účet nedáva na ten istý post dve akcie a na jeden post nekomentuje viac ako jeden účet.
+      5. Komentár píš pre konkrétny príspevok podľa `post_context`. Bez kontextu komentár nevymýšľaj, vypýtaj si ho. Každý komentár má mať iné slová, dĺžku aj štruktúru. Žiadne copy-paste šablóny.
+      6. Komentár nikdy nehovorí ani nenaznačuje, že autor je nezávislý zákazník, a neobsahuje vymyslené skúsenosti, testimoniály, hodnotenia ani porovnania s konkurenciou. Hovorí tónom značky, o veciach, ktoré reálne vieš z kontextu.
+      7. Nepoužívaj slová z blacklistu, neosobuj sa, nerob odkazy ani výzvy na follow/DM.
+      8. Všetky komentáre majú status `awaiting_approval`. Likes majú `pending`.
+      9. Po vytvorení úloh stručne potvrď: účet, akcia, post.
+
+      ## Výstup (iba JSON)
+      ```json
+      {
+        "tasks": [
+          {"account": "username", "post_url": "...", "action": "like|comment",
+           "comment_text": "... (len pri comment)", "post_context": "..."}
+        ],
+        "rejected": [{"post_url": "...", "reason": "..."}],
+        "notes": "krátke zhrnutie pre operátora"
+      }
+      ```
+  wf_01:
+    content: |
+      {
+        "name": "01 Intake",
+        "nodes": [
+          {
+            "parameters": {
+              "httpMethod": "POST",
+              "path": "command",
+              "responseMode": "lastNode",
+              "options": {}
+            },
+            "name": "Webhook command",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 2,
+            "position": [
+              0,
+              0
+            ],
+            "webhookId": "cmd-intake-1",
+            "id": "b150699c-a964-4a57-85a1-5bedca5da7ec"
+          },
+          {
+            "parameters": {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $$json.headers['x-api-key'] }}",
+                    "rightValue": "={{ $$env.COMMAND_KEY }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            "name": "Auth ok?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2.2,
+            "position": [
+              220,
+              0
+            ],
+            "id": "c7378636-244c-4d92-b5b1-c86473990f81"
+          },
+          {
+            "parameters": {
+              "method": "POST",
+              "url": "http://manager:8000/api/agent",
+              "sendHeaders": true,
+              "headerParameters": {
+                "parameters": [
+                  {
+                    "name": "x-api-key",
+                    "value": "={{ $$env.COMMAND_KEY }}"
+                  },
+                  {
+                    "name": "content-type",
+                    "value": "application/json"
+                  }
+                ]
+              },
+              "sendBody": true,
+              "specifyBody": "json",
+              "jsonBody": "={{ JSON.stringify({ command: $$('Webhook command').first().json.body.command, requested_by: $$('Webhook command').first().json.body.requested_by || 'operator' }) }}",
+              "options": {
+                "timeout": 900000,
+                "response": {
+                  "response": {
+                    "neverError": true
+                  }
+                }
+              }
+            },
+            "name": "Boss agent (manager)",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+              440,
+              0
+            ],
+            "id": "0233485c-529a-4f7b-8215-aeceea29b4f6"
+          },
+          {
+            "parameters": {
+              "jsCode": "const j = $$json;\nif (!j.created) return [{ json: { msg: '⚠️ Šéf-agent zlyhal: ' + (j.data || JSON.stringify(j)).toString().slice(0, 400) } }];\nconst base = $$env.N8N_PUBLIC_URL, key = $$env.APPROVAL_KEY;\nlet msg = 'Vytvorených úloh: ' + j.created.length + ' (model ' + j.model + ')' + (j.notes ? '\\n' + j.notes : '') + '\\n';\nfor (const r of j.created) {\n  if (r.action === 'comment') msg += `\\n#$${r.id} komentár ($${r.account}) na $${r.post_url}\\n\"$${r.comment_text}\"\\n✅ $${base}webhook/approve?task=$${r.id}&key=$${key}&by=operator\\n❌ $${base}webhook/approve?task=$${r.id}&key=$${key}&decision=reject\\n`;\n  else msg += `\\n#$${r.id} like ($${r.account}) na $${r.post_url}`;\n}\nif (j.rejected && j.rejected.length) msg += '\\n\\nZamietnuté:\\n' + j.rejected.map(x => '- ' + x.reason + (x.post_url ? ' (' + x.post_url + ')' : '')).join('\\n');\nreturn [{ json: { msg } }];"
+            },
+            "name": "Build summary",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+              660,
+              0
+            ],
+            "id": "b595eb1e-81c0-4d1a-9ee3-07da38c4877f"
+          },
+          {
+            "parameters": {
+              "method": "POST",
+              "url": "={{ $$env.NOTIFY_URL }}",
+              "sendBody": true,
+              "specifyBody": "json",
+              "jsonBody": "={{ JSON.stringify({ text: $$json.msg, chat_id: $$env.TELEGRAM_CHAT_ID || undefined }) }}"
+            },
+            "name": "Notify operator",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+              880,
+              0
+            ],
+            "id": "e2274202-9074-48ba-a5e2-630c10907ae5"
+          }
+        ],
+        "connections": {
+          "Webhook command": {
+            "main": [
+              [
+                {
+                  "node": "Auth ok?",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          },
+          "Auth ok?": {
+            "main": [
+              [
+                {
+                  "node": "Boss agent (manager)",
+                  "type": "main",
+                  "index": 0
+                }
+              ],
+              []
+            ]
+          },
+          "Boss agent (manager)": {
+            "main": [
+              [
+                {
+                  "node": "Build summary",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          },
+          "Build summary": {
+            "main": [
+              [
+                {
+                  "node": "Notify operator",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          }
+        },
+        "settings": {},
+        "id": "igintake",
+        "active": false
+      }
+  wf_02:
+    content: |
+      {
+        "name": "02 Approval",
+        "nodes": [
+          {
+            "parameters": {
+              "httpMethod": "GET",
+              "path": "approve",
+              "responseMode": "lastNode",
+              "options": {}
+            },
+            "name": "Webhook approve",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 2,
+            "position": [
+              0,
+              0
+            ],
+            "webhookId": "approve-1",
+            "id": "fa4a3ae2-14db-4183-866e-4cc86768f708"
+          },
+          {
+            "parameters": {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $$json.query.key }}",
+                    "rightValue": "={{ $$env.APPROVAL_KEY }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            "name": "Key ok?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2.2,
+            "position": [
+              220,
+              0
+            ],
+            "id": "88d5abd5-6d06-4469-b3cf-1506d9fb6fbf"
+          },
+          {
+            "parameters": {
+              "operation": "executeQuery",
+              "query": "UPDATE tasks SET status = CASE WHEN $$2='reject' THEN 'cancelled' ELSE 'pending' END,\n  approved_by = CASE WHEN $$2='reject' THEN NULL ELSE $$3 END,\n  approved_at = CASE WHEN $$2='reject' THEN NULL ELSE now() END\nWHERE id=$$1::bigint AND status='awaiting_approval' RETURNING id,status;",
+              "options": {
+                "queryReplacement": "={{ [$$json.query.task, $$json.query.decision || 'approve', $$json.query.by || 'operator'] }}"
+              }
+            },
+            "name": "Set status",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.5,
+            "position": [
+              440,
+              0
+            ],
+            "credentials": {
+              "postgres": {
+                "id": "pgigagents",
+                "name": "Postgres igagents"
+              }
+            },
+            "id": "82794344-336f-4778-b576-42753764d5a1"
+          },
+          {
+            "parameters": {
+              "jsCode": "return [{ json: { ok: $$input.all().length>0 && !!$$input.first().json.id, result: $$input.first().json } }];"
+            },
+            "name": "Response",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+              660,
+              0
+            ],
+            "id": "b44b579e-1373-4b1a-8f6e-f0813d934ec3"
+          }
+        ],
+        "connections": {
+          "Webhook approve": {
+            "main": [
+              [
+                {
+                  "node": "Key ok?",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          },
+          "Key ok?": {
+            "main": [
+              [
+                {
+                  "node": "Set status",
+                  "type": "main",
+                  "index": 0
+                }
+              ],
+              []
+            ]
+          },
+          "Set status": {
+            "main": [
+              [
+                {
+                  "node": "Response",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          }
+        },
+        "settings": {},
+        "id": "igapproval",
+        "active": false
+      }
+  wf_03:
+    content: |
+      {
+        "name": "03 Risk alert",
+        "nodes": [
+          {
+            "parameters": {
+              "httpMethod": "POST",
+              "path": "risk-alert",
+              "responseMode": "lastNode",
+              "options": {}
+            },
+            "name": "Webhook risk",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 2,
+            "position": [
+              0,
+              0
+            ],
+            "webhookId": "risk-1",
+            "id": "d106e591-4dc0-4521-bc81-f29f0a1bf9d7"
+          },
+          {
+            "parameters": {
+              "method": "POST",
+              "url": "={{ $$env.NOTIFY_URL }}",
+              "sendBody": true,
+              "specifyBody": "json",
+              "jsonBody": "={{ JSON.stringify({ text: '🚨 ' + $$json.body.account + ' [' + $$json.body.kind + ']: ' + $$json.body.message, chat_id: $$env.TELEGRAM_CHAT_ID || undefined }) }}"
+            },
+            "name": "Notify risk",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+              240,
+              0
+            ],
+            "id": "27f9f394-9bea-4058-b2eb-f0677519f56e"
+          }
+        ],
+        "connections": {
+          "Webhook risk": {
+            "main": [
+              [
+                {
+                  "node": "Notify risk",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          }
+        },
+        "settings": {},
+        "id": "igrisk",
+        "active": false
+      }
+  wf_04:
+    content: |
+      {
+        "name": "04 Daily report",
+        "nodes": [
+          {
+            "parameters": {
+              "rule": {
+                "interval": [
+                  {
+                    "field": "cronExpression",
+                    "expression": "0 20 * * *"
+                  }
+                ]
+              }
+            },
+            "name": "Cron 20:00",
+            "type": "n8n-nodes-base.scheduleTrigger",
+            "typeVersion": 1.2,
+            "position": [
+              0,
+              0
+            ],
+            "id": "ace4c165-b7dc-4b1a-81e0-320f59a31dc9"
+          },
+          {
+            "parameters": {
+              "operation": "executeQuery",
+              "query": "SELECT\n (SELECT count(*) FROM tasks WHERE finished_at::date=current_date AND status='done') AS done,\n (SELECT count(*) FROM tasks WHERE finished_at::date=current_date AND status='failed') AS failed,\n (SELECT count(*) FROM tasks WHERE status='awaiting_approval') AS waiting,\n (SELECT coalesce(string_agg(ig_username||' ('||coalesce(risk_reason,'?')||')', ', '),'-') FROM accounts WHERE status='risk') AS risk;",
+              "options": {}
+            },
+            "name": "Stats",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.5,
+            "position": [
+              220,
+              0
+            ],
+            "credentials": {
+              "postgres": {
+                "id": "pgigagents",
+                "name": "Postgres igagents"
+              }
+            },
+            "id": "fb732ce8-7cb0-4f44-946a-6d9a276b346c"
+          },
+          {
+            "parameters": {
+              "method": "POST",
+              "url": "={{ $$env.NOTIFY_URL }}",
+              "sendBody": true,
+              "specifyBody": "json",
+              "jsonBody": "={{ JSON.stringify({ text: '📊 Denný report\\nhotové: '+$$json.done+'\\nzlyhané: '+$$json.failed+'\\nčakajú na schválenie: '+$$json.waiting+'\\núčty v riziku: '+$$json.risk, chat_id: $$env.TELEGRAM_CHAT_ID || undefined }) }}"
+            },
+            "name": "Send report",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+              440,
+              0
+            ],
+            "id": "851ab555-c292-4974-bd01-e6ebfa18739c"
+          }
+        ],
+        "connections": {
+          "Cron 20:00": {
+            "main": [
+              [
+                {
+                  "node": "Stats",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          },
+          "Stats": {
+            "main": [
+              [
+                {
+                  "node": "Send report",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          }
+        },
+        "settings": {},
+        "id": "igreport",
+        "active": false
+      }
+  wf_05:
+    content: |
+      {
+        "name": "05 Monitor",
+        "nodes": [
+          {
+            "parameters": {
+              "rule": {
+                "interval": [
+                  {
+                    "field": "cronExpression",
+                    "expression": "*/5 * * * *"
+                  }
+                ]
+              }
+            },
+            "name": "Every 5 min",
+            "type": "n8n-nodes-base.scheduleTrigger",
+            "typeVersion": 1.2,
+            "position": [
+              0,
+              0
+            ],
+            "id": "289e3c67-dcf2-46ec-bec7-8831e6308984"
+          },
+          {
+            "parameters": {
+              "operation": "executeQuery",
+              "query": "SELECT\n (SELECT coalesce(count(*) FILTER (WHERE status='failed')::float/NULLIF(count(*),0),0) FROM tasks WHERE finished_at > now()-interval '1 hour' AND status IN ('done','failed')) AS fail_rate,\n (SELECT coalesce(string_agg(ig_username, ', '),'') FROM accounts WHERE status='active' AND (last_seen IS NULL OR last_seen < now()-interval '10 minutes')) AS silent;",
+              "options": {}
+            },
+            "name": "Health query",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.5,
+            "position": [
+              220,
+              0
+            ],
+            "credentials": {
+              "postgres": {
+                "id": "pgigagents",
+                "name": "Postgres igagents"
+              }
+            },
+            "id": "365ed476-3cb7-4fe7-b04f-be0730463dca"
+          },
+          {
+            "parameters": {
+              "jsCode": "const r = $$json; const msgs = [];\nif (r.fail_rate > 0.2) msgs.push('Podiel zlyhaných úloh za poslednú hodinu: ' + Math.round(r.fail_rate*100) + ' %');\nif (r.silent) msgs.push('Worker nereaguje 10+ min: ' + r.silent);\nreturn msgs.length ? [{ json: { msg: '⚠️ ' + msgs.join('\\n') } }] : [];"
+            },
+            "name": "Evaluate",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+              440,
+              0
+            ],
+            "id": "a6569a19-5b50-4e06-b8af-d22126c35276"
+          },
+          {
+            "parameters": {
+              "method": "POST",
+              "url": "={{ $$env.NOTIFY_URL }}",
+              "sendBody": true,
+              "specifyBody": "json",
+              "jsonBody": "={{ JSON.stringify({ text: $$json.msg, chat_id: $$env.TELEGRAM_CHAT_ID || undefined }) }}"
+            },
+            "name": "Notify monitor",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+              660,
+              0
+            ],
+            "id": "d52d94e5-b22c-42d9-b073-037708dd7553"
+          }
+        ],
+        "connections": {
+          "Every 5 min": {
+            "main": [
+              [
+                {
+                  "node": "Health query",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          },
+          "Health query": {
+            "main": [
+              [
+                {
+                  "node": "Evaluate",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          },
+          "Evaluate": {
+            "main": [
+              [
+                {
+                  "node": "Notify monitor",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          }
+        },
+        "settings": {},
+        "id": "igmonitor",
+        "active": false
+      }
+  wf_06:
+    content: |
+      {
+        "name": "Daily reset",
+        "nodes": [
+          {
+            "parameters": {
+              "rule": {
+                "interval": [
+                  {
+                    "field": "cronExpression",
+                    "expression": "0 0 * * *"
+                  }
+                ]
+              }
+            },
+            "name": "Cron 00:00",
+            "type": "n8n-nodes-base.scheduleTrigger",
+            "typeVersion": 1.2,
+            "position": [
+              0,
+              0
+            ],
+            "id": "644f1d66-0344-47ed-86b0-46bcb6335523"
+          },
+          {
+            "parameters": {
+              "operation": "executeQuery",
+              "query": "UPDATE accounts SET likes_today=0, comments_today=0;"
+            },
+            "name": "Reset counters",
+            "type": "n8n-nodes-base.postgres",
+            "typeVersion": 2.5,
+            "position": [
+              260,
+              0
+            ],
+            "credentials": {
+              "postgres": {
+                "id": "pgigagents",
+                "name": "Postgres igagents"
+              }
+            },
+            "id": "7d67eff3-48d0-4ce9-bd69-73f99a628fd8"
+          }
+        ],
+        "connections": {
+          "Cron 00:00": {
+            "main": [
+              [
+                {
+                  "node": "Reset counters",
+                  "type": "main",
+                  "index": 0
+                }
+              ]
+            ]
+          }
+        },
+        "settings": {},
+        "id": "igreset",
+        "active": false
+      }
