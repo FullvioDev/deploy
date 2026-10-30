@@ -33,8 +33,6 @@ services:
     restart: always
     ports:
       - "${HOST_PORT:-5678}:5678"
-    env_file:
-      - ./keys/spinex.env
     environment:
       NODE_ENV: "production"
       N8N_DIAGNOSTICS_ENABLED: "false"
@@ -94,8 +92,6 @@ services:
     command: worker
     ports:
       - "${WORKER_METRICS_PORT:-5688}:5678"
-    env_file:
-      - ./keys/spinex.env
     environment:
       NODE_ENV: "production"
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
@@ -134,8 +130,6 @@ services:
     image: n8nio/runners:${RUNNERS_IMAGE:-2.31.5}
     container_name: ${N8N_RUNNERS_MAIN_CNTNR:-n8n_runners-main}
     restart: always
-    env_file:
-      - ./keys/spinex.env
     environment:
       N8N_RUNNERS_TASK_BROKER_URI: "http://n8n:5679"
       N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
@@ -148,8 +142,6 @@ services:
     image: n8nio/runners:${RUNNERS_IMAGE:-2.31.5}
     container_name: ${N8N_RUNNERS_WORKER_CNTNR:-n8n_runners-worker}
     restart: always
-    env_file:
-      - ./keys/spinex.env
     environment:
       N8N_RUNNERS_TASK_BROKER_URI: "http://n8n-worker:5679"
       N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
