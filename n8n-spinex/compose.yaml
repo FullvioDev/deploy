@@ -1,3 +1,30 @@
+# Runner image = n8nio/runners + the extra modules Code nodes require().
+# The stock image ships only `moment`, and its launcher config
+# (/etc/n8n-task-runners.json) hard-codes NODE_FUNCTION_ALLOW_BUILTIN=crypto and
+# NODE_FUNCTION_ALLOW_EXTERNAL=moment in env-overrides, so the NODE_FUNCTION_ALLOW_*
+# set on the runner containers never reached the runner. The build moves both
+# keys from env-overrides to allowed-env, so the values in the runners'
+# `environment:` are the ones that apply. A new external module needs both:
+# `pnpm add` here and an entry in NODE_FUNCTION_ALLOW_EXTERNAL on the runners.
+x-runners-build: &runners-build
+  dockerfile_inline: |
+    FROM n8nio/runners:${RUNNERS_IMAGE:-2.31.5}
+    USER root
+    # pnpm pinned to PNPM_VERSION from n8n's docker/images/runners/Dockerfile: a bare
+    # `pnpm` resolves to corepack's latest (11.x), which re-resolves the whole graph.
+    RUN cd /opt/runners/task-runner-javascript && \
+        COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack pnpm@10.32.1 add --prod --no-lockfile \
+          xml-crypto@6.4.0 iconv-lite@0.7.3 @xmldom/xmldom@0.8.15
+    RUN node -e "const fs = require('fs'), f = '/etc/n8n-task-runners.json'; \
+          const cfg = JSON.parse(fs.readFileSync(f, 'utf8')); \
+          const js = cfg['task-runners'].find((r) => r['runner-type'] === 'javascript'); \
+          for (const k of ['NODE_FUNCTION_ALLOW_BUILTIN', 'NODE_FUNCTION_ALLOW_EXTERNAL']) { \
+            delete js['env-overrides'][k]; \
+            js['allowed-env'].push(k); \
+          } \
+          fs.writeFileSync(f, JSON.stringify(cfg, null, 2));"
+    USER runner
+
 services:
   postgres:
     image: postgres:${POSTGRES_IMAGE:-16}
@@ -127,7 +154,9 @@ services:
         condition: service_healthy
 
   n8n-runners-main:
-    image: n8nio/runners:${RUNNERS_IMAGE:-2.31.5}
+    image: n8n-spinex-runners:${RUNNERS_IMAGE:-2.31.5}
+    build: *runners-build
+    pull_policy: build
     container_name: ${N8N_RUNNERS_MAIN_CNTNR:-n8n_runners-main}
     restart: always
     environment:
@@ -139,7 +168,9 @@ services:
       - n8n
 
   n8n-runners-worker:
-    image: n8nio/runners:${RUNNERS_IMAGE:-2.31.5}
+    image: n8n-spinex-runners:${RUNNERS_IMAGE:-2.31.5}
+    build: *runners-build
+    pull_policy: build
     container_name: ${N8N_RUNNERS_WORKER_CNTNR:-n8n_runners-worker}
     restart: always
     environment:
